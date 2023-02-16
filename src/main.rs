@@ -1,6 +1,7 @@
-use std::{ future::Future, task::{ Context, Poll, Pin } };
+#![feature(box_syntax)]
+
+use std::{ future::Future, task::{ Context, Poll }, pin::Pin };
 use winit::{
-    dpi::LogicalSize,
     event::*,
     event_loop::{ControlFlow, EventLoop},
     window::Window,
@@ -10,14 +11,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let state = Box::leak(
-        box State::new().await
-    );
+    env_logger::init();
 
-    state.run().await;
+    let state = State::new().await;
 
+    State::run(state).await;
+    
     Ok(())
 }
+
+type Identifier = u32;
 
 struct Chunk {}
 
@@ -36,7 +39,9 @@ struct Spawner {}
 impl Future for Spawner {
     type Output = Identifier;
 
-    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {}
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        Poll::Pending
+    }
 }
 
 enum EntityState {
@@ -47,10 +52,13 @@ enum EntityState {
 }
 
 struct State {
-    entities: Vec<EntityState>,
-    event_loop: EventLoop<Window>,
-    graphics: Graphics,
+    inner: Arc<Mutex<Inner>>,
+}
 
+struct Inner {
+    entities: Vec<EntityState>,
+    event_loop: EventLoop<()>,
+    graphics: Graphics,
 }
 
 impl State {
@@ -58,14 +66,19 @@ impl State {
         let event_loop = EventLoop::new();
         Self {
             graphics: Graphics::new(&event_loop).await,
-            event_loop
+            entities: vec![],
+            event_loop,
         }
     }
 
-    async fn run(&mut self) {
-        env_logger::init();
+    async fn run(mut self) -> Completion {
+        let Self {
+            event_loop
+            , ..
+        } = self;
 
-        self.event_loop.run(move |event, _, control_flow| match event {
+        loop {
+        event_loop.run(move |event, _, control_flow| match event {
             Event::WindowEvent {
                 ref event,
                 window_id,
@@ -91,6 +104,9 @@ impl State {
             }
             _ => {}
         });
+        }
+
+        Poll::Pending
     }
 }
 
@@ -105,8 +121,10 @@ struct Graphics {
 }
 
 impl Graphics {
-    async fn new(window: Window) -> Self {
-        let size = window.inner_size();
+    async fn new(event_loop: &EventLoop<()>) -> Self {
+        let window = WindowBuilder::new().build(&event_loop).unwrap(); 
+
+        let window_size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
@@ -157,8 +175,8 @@ impl Graphics {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width: size.width,
-            height: size.height,
+            width: window_size.width,
+            height: window_size.height,
             present_mode: surface_caps.present_modes[0],
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
@@ -220,7 +238,7 @@ impl Graphics {
             device,
             queue,
             config,
-            size,
+            window_size,
             render_pipeline,
         }
     }
