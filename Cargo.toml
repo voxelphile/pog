@@ -11,3 +11,4 @@ env_logger = "0.10"
 log = "0.4"
 wgpu = "0.15"
 tokio = { version = "1.25.0", features = ["full"] }
+bytemuck = "1.13.0"

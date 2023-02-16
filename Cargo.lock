@@ -1113,6 +1113,7 @@ dependencies = [
 name = "pog"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "env_logger",
  "log",
  "tokio",
