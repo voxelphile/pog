@@ -1,3 +1,4 @@
+use std::{ future::Future, task::{ Context, Poll, Pin } };
 use winit::{
     dpi::LogicalSize,
     event::*,
@@ -5,59 +6,105 @@ use winit::{
     window::Window,
     window::WindowBuilder,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn main() {
-    use pollster::FutureExt;
-    let result = run().block_on();
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let state = Box::leak(
+        box State::new().await
+    );
+
+    state.run().await;
+
+    Ok(())
 }
 
-async fn run() -> ! {
-    env_logger::init();
+struct Chunk {}
 
-    let event_loop = EventLoop::new();
-    let window = WindowBuilder::new().build(&event_loop).unwrap();
-    let mut state = State::new(window).await;
+impl Entity for Chunk {}
 
-    event_loop.run(move |event, _, control_flow| match event {
-        Event::WindowEvent {
-            ref event,
-            window_id,
-        } if window_id == state.window.id() => match event {
-            WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-            WindowEvent::Resized(physical_size) => {
-                state.size = *physical_size;
-            }
-            WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                state.size = **new_inner_size;
-            }
-            _ => {}
-        },
-        Event::RedrawRequested(window_id) if window_id == state.window().id() => {
-            state.update();
-            match state.render() {
-                Err(wgpu::SurfaceError::Outdated) => state.resize(),
-                Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
-                _ => {}
-            }
-        }
-        Event::MainEventsCleared => {
-            state.window().request_redraw();
-        }
-        _ => {}
-    });
+impl Spawnable for Chunk {}
+
+trait Entity {}
+
+trait Spawnable: Entity {}
+
+struct Spawn<T: Spawnable>(T);
+
+struct Spawner {}
+
+impl Future for Spawner {
+    type Output = Identifier;
+
+    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {}
+}
+
+enum EntityState {
+    Free,
+    Spawn,
+    Active(Box<dyn Entity>),
+    Despawn,
 }
 
 struct State {
+    entities: Vec<EntityState>,
+    event_loop: EventLoop<Window>,
+    graphics: Graphics,
+
+}
+
+impl State {
+    async fn new() -> Self {
+        let event_loop = EventLoop::new();
+        Self {
+            graphics: Graphics::new(&event_loop).await,
+            event_loop
+        }
+    }
+
+    async fn run(&mut self) {
+        env_logger::init();
+
+        self.event_loop.run(move |event, _, control_flow| match event {
+            Event::WindowEvent {
+                ref event,
+                window_id,
+            } if window_id == self.graphics.window.id() => match event {
+                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                WindowEvent::Resized(physical_size) => {
+                    self.graphics.window_size = *physical_size;
+                }
+                WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                    self.graphics.window_size = **new_inner_size;
+                }
+                _ => {}
+            },
+            Event::RedrawRequested(window_id) if window_id == self.graphics.window.id() => {
+                match self.graphics.render() {
+                    Err(wgpu::SurfaceError::Outdated) => self.graphics.resize(),
+                    Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
+                    _ => {}
+                }
+            }
+            Event::MainEventsCleared => {
+                self.graphics.window.request_redraw();
+            }
+            _ => {}
+        });
+    }
+}
+
+struct Graphics {
     surface: wgpu::Surface,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    size: winit::dpi::PhysicalSize<u32>,
+    window_size: winit::dpi::PhysicalSize<u32>,
     window: Window,
     render_pipeline: wgpu::RenderPipeline,
 }
 
-impl State {
+impl Graphics {
     async fn new(window: Window) -> Self {
         let size = window.inner_size();
 
@@ -178,23 +225,13 @@ impl State {
         }
     }
 
-    pub fn window(&self) -> &Window {
-        &self.window
-    }
-
     fn resize(&mut self) {
-        if self.size.width > 0 && self.size.height > 0 {
-            self.config.width = self.size.width;
-            self.config.height = self.size.height;
+        if self.window_size.width > 0 && self.window_size.height > 0 {
+            self.config.width = self.window_size.width;
+            self.config.height = self.window_size.height;
             self.surface.configure(&self.device, &self.config);
         }
     }
-
-    fn input(&mut self, event: &WindowEvent) -> bool {
-        false
-    }
-
-    fn update(&mut self) {}
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
