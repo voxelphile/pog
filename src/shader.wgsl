@@ -58,9 +58,9 @@ fn cs_perframe() {
 	if(data_buffer.load == u32(0)) {
 		data_buffer.indirect.draw_vertex_count = u32(36);
 		data_buffer.indirect.draw_instance_count = u32(0);
-		data_buffer.indirect.build_x = u32(size.x / 8);
-		data_buffer.indirect.build_y = u32(size.y / 8);
-		data_buffer.indirect.build_z = u32(size.z / 8);
+		data_buffer.indirect.build_x = u32(size.x / 4);
+		data_buffer.indirect.build_y = u32(size.y / 4);
+		data_buffer.indirect.build_z = u32(size.z / 4);
 		data_buffer.indirect.setup_x = u32(size.x / 8)
 			* u32(size.y / 8)
 			* u32(size.z / 8);
@@ -80,27 +80,27 @@ fn cs_perframe() {
 }
 
 @compute
-@workgroup_size(8)
+@workgroup_size(4,4,4)
 fn cs_build(@builtin(global_invocation_id) gid: vec3<u32>) {
-	if(gid.x == u32(0) && gid.y == u32(0) && gid.z == u32(0)) {
 		textureStore(region_storage, gid, vec4<u32>(u32(1)));
-	}
 }
 
 
 @compute
-@workgroup_size(1)
+@workgroup_size(1,1,1)
 fn cs_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
+	var size: vec3<i32> = textureDimensions(region_texture) / 8;
+	
 	var empty = true;
 
-	var id = gid.x;
-				
+	var id = gid.x;		
+	
 	var idx = id;
 	var chunk_pos = vec3<u32>(u32(0));
-	chunk_pos.z = idx / u32(8 * 8);
-	idx -= chunk_pos.z * u32(8 * 8);
-	chunk_pos.y = idx / u32(8);
-	chunk_pos.x = idx % u32(8);
+	chunk_pos.z = idx / u32(size.x * size.y);
+	idx -= chunk_pos.z * u32(size.x * size.y);
+	chunk_pos.y = idx / u32(size.x);
+	chunk_pos.x = idx % u32(size.x);
 
 	for(var x = 0; x < 8 && empty; x++) {
 		for(var y = 0; y < 8 && empty; y++) {
@@ -117,8 +117,8 @@ fn cs_setup(@builtin(global_invocation_id) gid: vec3<u32>) {
 	}
 
 	if(!empty) {
-		data_buffer.instance_ids[id] = chunk_pos; 
-		data_buffer.indirect.draw_instance_count = u32(1);
+		var instance = atomicAdd(&data_buffer.indirect.draw_instance_count, u32(1));
+		data_buffer.instance_ids[instance] = chunk_pos; 
 	}
 }
 
@@ -146,7 +146,9 @@ fn vs_main(
 
 	var local_position = offsets[indices[j]];
 
-	var world_position = local_position - vec3(0.0, 0.0, 2.0);
+	var chunk_position = vec3<f32>(data_buffer.instance_ids[i].xyz);
+
+	var world_position = local_position + chunk_position;
 
 
 	var out: VertexOutput;

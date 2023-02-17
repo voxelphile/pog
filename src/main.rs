@@ -127,7 +127,7 @@ impl State {
                 view: Matrix4::<f32>::identity(),
                 projection: Matrix4::<f32>::identity(),
                 inv_projection: Matrix4::<f32>::identity(),
-                position: Vector4::<f32>::new(0.0, 0.0, 0.0, 1.0),
+                position: Vector4::<f32>::new(0.0, 0.0, 10.0, 1.0),
                 rotation: Quaternion::<f32>::new(0.0, 0.0, 0.0, 0.0),
                 aspect_ratio: 0.0,
             },
