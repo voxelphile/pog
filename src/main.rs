@@ -1,9 +1,11 @@
+use cgmath::{Deg, Euler, Matrix4, PerspectiveFov, Quaternion, Rad, Vector3, InnerSpace, SquareMatrix, Vector4, Rotation3};
 use std::{
+    future::Future,
     mem,
     num::NonZeroU64,
-    future::Future,
     pin::Pin,
     task::{Context, Poll},
+    time,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use winit::{
@@ -12,6 +14,14 @@ use winit::{
     window::Window,
     window::WindowBuilder,
 };
+
+#[rustfmt::skip]
+pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 0.5, 0.0,
+    0.0, 0.0, 0.5, 1.0,
+);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,41 +33,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-/*
-type Identifier = u32;
 
-struct Chunk {}
+struct World;
 
-impl Entity for Chunk {}
+impl World {
+    fn update(delta_time: f32, perframe_data: &mut PerframeData) {
 
-impl Spawnable for Chunk {}
+        const sens: f32 = 0.0002;
+    
+        let rot_z = Quaternion::from_angle_z(
+            Rad(perframe_data.rot_z)
+        );
+        
+        perframe_data.camera.rotation = rot_z;
+        
+        let rot_x = Quaternion::from_angle_x(
+            Rad(perframe_data.rot_x)
+        );
+        
+        perframe_data.camera.rotation = perframe_data.camera.rotation * rot_x;
 
-trait Entity {}
 
-trait Spawnable: Entity {}
+        let mut dx = perframe_data.right as f32 - perframe_data.left as f32;
+        let mut dy = perframe_data.forward as f32 - perframe_data.backward as f32;
+        let mut dz = perframe_data.up as f32 - perframe_data.down as f32;
 
-struct Spawn<T: Spawnable>(T);
+        let mut adjusted_movement = (rot_z *
+            Vector3 { x: dx, y: dy, z: 0.0 });
 
-struct Spawner {}
+        if adjusted_movement.dot(adjusted_movement) != 0.0 {
+            adjusted_movement = adjusted_movement.normalize();
+        }
+        
+        dx = adjusted_movement.x;
+        dy = adjusted_movement.y;
+        
+        dx *= delta_time;
+        dy *= delta_time;
+        dz *= delta_time;
 
-impl Future for Spawner {
-    type Output = Identifier;
 
-    fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-        Poll::Pending
+        perframe_data.camera.position += Vector4 {
+            x: dx,
+            y: dy,
+            z: dz,
+            w: 0.0,
+        };
+        perframe_data.camera.position[3] = 1.0;
+
+        perframe_data.camera.transform = perframe_data.camera.rotation.into();
+        perframe_data.camera.transform[3] = perframe_data.camera.position;
+
+        perframe_data.camera.view = perframe_data.camera.transform.invert().unwrap();
+
+        perframe_data.camera.projection = OPENGL_TO_WGPU_MATRIX
+            * Matrix4::from(
+                cgmath::PerspectiveFov::<f32> {
+                    fovy: Deg(90.0).into(),
+                    aspect: perframe_data.camera.aspect_ratio,
+                    near: 0.1,
+                    far: 1000.0,
+                }
+                .to_perspective(),
+            );
+
+        perframe_data.camera.inv_projection = perframe_data.camera.projection.invert().unwrap();
     }
 }
-
-enum EntityState {
-    Free,
-    Spawn,
-    Active(Box<dyn Entity>),
-    Despawn,
-}*/
 
 struct State {
     event_loop: EventLoop<()>,
     graphics: Graphics,
+    world: World,
 }
 
 impl State {
@@ -65,7 +112,7 @@ impl State {
         let event_loop = EventLoop::new();
         Self {
             graphics: Graphics::new(&event_loop).await,
-            //entities: vec![],
+            world: World,
             event_loop,
         }
     }
@@ -74,7 +121,29 @@ impl State {
         let Self { event_loop, .. } = self;
 
         let mut cursor_captured = false;
-        let mut perframe_data = PerframeData::default();
+        let mut perframe_data = PerframeData {
+            camera: Camera {
+                transform: Matrix4::<f32>::identity(),
+                view: Matrix4::<f32>::identity(),
+                projection: Matrix4::<f32>::identity(),
+                inv_projection: Matrix4::<f32>::identity(),
+                position: Vector4::<f32>::new(0.0, 0.0, 0.0, 1.0),
+                rotation: Quaternion::<f32>::new(0.0, 0.0, 0.0, 0.0),
+                aspect_ratio: 0.0,
+            },
+            up: 0,
+            down: 0,
+            left: 0,
+            right: 0,
+            forward: 0,
+            backward: 0,
+            action1: 0,
+            action2: 0,
+            rot_x: 0.0,
+            rot_z: 0.0,
+        };
+
+        let mut last_instant = time::Instant::now();
 
         event_loop.run(move |event, _, control_flow| match event {
             Event::WindowEvent {
@@ -84,104 +153,110 @@ impl State {
                 WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
                 WindowEvent::Resized(physical_size) => {
                     self.graphics.window_size = *physical_size;
+                    perframe_data.camera.aspect_ratio =
+                        physical_size.width as f32 / physical_size.height as f32;
                 }
                 WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
                     self.graphics.window_size = **new_inner_size;
+                    perframe_data.camera.aspect_ratio =
+                        new_inner_size.width as f32 / new_inner_size.height as f32;
                 }
-                _ => {}
-            },
-             Event::WindowEvent {
-                event: WindowEvent::CursorMoved { position, .. },
-                window_id,
-            } => {
-                if cursor_captured {
-                    let winit::dpi::PhysicalPosition { x, y } = position;
+                WindowEvent::CursorMoved { position, .. } => {
+                    if cursor_captured {
+                        let winit::dpi::PhysicalPosition { x, y } = position;
 
-                    let winit::dpi::PhysicalSize { width, height } = self.graphics.window.inner_size();
+                        let winit::dpi::PhysicalSize { width, height } =
+                            self.graphics.window.inner_size();
 
-                    let x_diff = x - width as f64 / 2.0;
-                    let y_diff = y - height as f64 / 2.0;
+                        let x_diff = x - width as f64 / 2.0;
+                        let y_diff = y - height as f64 / 2.0;
 
-                    self.graphics.window.set_cursor_position(winit::dpi::PhysicalPosition::new(
-                        width as i32 / 2,
-                        height as i32 / 2,
-                    ));
+                        self.graphics.window.set_cursor_position(
+                            winit::dpi::PhysicalPosition::new(width as i32 / 2, height as i32 / 2),
+                        );
+        
+                        const SENS: f32 = 0.0002;
 
-                    perframe_data.look_x += x_diff as f32;
-                    perframe_data.look_y += y_diff as f32;
-                }
-            }
-            Event::WindowEvent {
-                event: WindowEvent::MouseInput { button, .. },
-                window_id,
-            } => {
-                use winit::event::MouseButton::*;
-                
-                match button {
-                    Left => {
-                        cursor_captured = true;
-                        self.graphics.window.set_cursor_icon(winit::window::CursorIcon::Crosshair);
-                        self.graphics.window
-                            .set_cursor_grab(winit::window::CursorGrabMode::Confined)
-                            .expect("could not grab mouse cursor");
-                        perframe_data.action1 = true as _;     
+                        perframe_data.rot_x -= SENS * y_diff as f32;
+                        perframe_data.rot_x = f32::clamp(perframe_data.rot_x, 0.0, 2.0 * std::f32::consts::PI);
+                        perframe_data.rot_z -= SENS * x_diff as f32;
                     }
-                    Right => {
-                        perframe_data.action2 = true as _;
-                    }
-                    _ => {}
                 }
-            }
-            Event::WindowEvent {
-                event: WindowEvent::KeyboardInput { input, .. },
-                window_id,
-            } => {
-                let Some(key_code) = input.virtual_keycode else {
+                WindowEvent::MouseInput { button, .. } => {
+                    use winit::event::MouseButton::*;
+
+                    match button {
+                        Left => {
+                            cursor_captured = true;
+                            self.graphics
+                                .window
+                                .set_cursor_icon(winit::window::CursorIcon::Crosshair);
+                            self.graphics
+                                .window
+                                .set_cursor_grab(winit::window::CursorGrabMode::Confined)
+                                .expect("could not grab mouse cursor");
+                            perframe_data.action1 = true as _;
+                        }
+                        Right => {
+                            perframe_data.action2 = true as _;
+                        }
+                        _ => {}
+                    }
+                }
+                WindowEvent::KeyboardInput { input, .. } => {
+                    let Some(key_code) = input.virtual_keycode else {
                     return;
                 };
 
-                use winit::event::VirtualKeyCode::*;
+                    use winit::event::VirtualKeyCode::*;
 
-                match key_code {
-                    W => {
-                        perframe_data.forward =
-                            (input.state == winit::event::ElementState::Pressed) as _
-                    }
-                    A => {
-                        perframe_data.left =
-                            (input.state == winit::event::ElementState::Pressed) as _
-                    }
-                    S => {
-                        perframe_data.backward =
-                            (input.state == winit::event::ElementState::Pressed) as _
-                    }
-                    D => {
-                        perframe_data.right =
-                            (input.state == winit::event::ElementState::Pressed) as _
-                    }
-                    Space => {
-                        perframe_data.up = (input.state == winit::event::ElementState::Pressed) as _
-                    }
-                    LShift => {
-                        perframe_data.down =
-                            (input.state == winit::event::ElementState::Pressed) as _
-                    }
-                    Escape => {
-                        cursor_captured = false;
-                        self.graphics.window.set_cursor_icon(winit::window::CursorIcon::Default);
-                        self.graphics.window
-                            .set_cursor_grab(winit::window::CursorGrabMode::None)
-                            .expect("could not grab mouse cursor");
-                    }
-                    _ => {}
-                };
-            }
+                    match key_code {
+                        W => {
+                            perframe_data.forward =
+                                (input.state == winit::event::ElementState::Pressed) as _
+                        }
+                        A => {
+                            perframe_data.left =
+                                (input.state == winit::event::ElementState::Pressed) as _
+                        }
+                        S => {
+                            perframe_data.backward =
+                                (input.state == winit::event::ElementState::Pressed) as _
+                        }
+                        D => {
+                            perframe_data.right =
+                                (input.state == winit::event::ElementState::Pressed) as _
+                        }
+                        Space => {
+                            perframe_data.up =
+                                (input.state == winit::event::ElementState::Pressed) as _
+                        }
+                        LShift => {
+                            perframe_data.down =
+                                (input.state == winit::event::ElementState::Pressed) as _
+                        }
+                        Escape => {
+                            cursor_captured = false;
+                            self.graphics
+                                .window
+                                .set_cursor_icon(winit::window::CursorIcon::Default);
+                            self.graphics
+                                .window
+                                .set_cursor_grab(winit::window::CursorGrabMode::None)
+                                .expect("could not grab mouse cursor");
+                        }
+                        _ => {}
+                    };
+                }
+                _ => {}
+            },
             Event::RedrawRequested(window_id) if window_id == self.graphics.window.id() => {
+                let current_instant = time::Instant::now();
+                let delta_time = current_instant.duration_since(last_instant).as_secs_f32();
+                last_instant = current_instant;
+                World::update(delta_time, &mut perframe_data);
+
                 match self.graphics.render(perframe_data) {
-                    Ok(_) => {
-                        perframe_data.look_x = 0.0;
-                        perframe_data.look_y = 0.0;
-                    },
                     Err(wgpu::SurfaceError::Outdated) => self.graphics.resize(),
                     Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
                     _ => {}
@@ -196,12 +271,21 @@ impl State {
 }
 
 #[repr(C)]
-#[derive(Default, Copy, Clone)]
-struct PerframeData {
-    fov: f32,
-    near: f32,
-    far: f32,
+#[derive(Copy, Clone)]
+struct Camera {
+    transform: Matrix4<f32>,
+    view: Matrix4<f32>,
+    projection: Matrix4<f32>,
+    inv_projection: Matrix4<f32>,
+    position: Vector4<f32>,
+    rotation: Quaternion<f32>,
     aspect_ratio: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct PerframeData {
+    camera: Camera,
     up: u32,
     down: u32,
     left: u32,
@@ -210,8 +294,8 @@ struct PerframeData {
     backward: u32,
     action1: u32,
     action2: u32,
-    look_x: f32,
-    look_y: f32,
+    rot_x: f32,
+    rot_z: f32,
 }
 
 unsafe impl bytemuck::Zeroable for PerframeData {}
@@ -234,6 +318,7 @@ struct Graphics {
     region_texture: wgpu::Texture,
     region_texture_view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
+    bind_group_region_storage: wgpu::BindGroup,
 }
 
 impl Graphics {
@@ -298,7 +383,7 @@ impl Graphics {
             view_formats: vec![],
         };
         surface.configure(&device, &config);
-        
+
         let indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Indirect Buffer"),
             usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
@@ -312,7 +397,7 @@ impl Graphics {
             size: 1_000_000,
             mapped_at_creation: false,
         });
-        
+
         let perframe_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Data Buffer"),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -320,76 +405,144 @@ impl Graphics {
             mapped_at_creation: false,
         });
 
+        let region_texture = device.create_texture(&wgpu::TextureDescriptor {
+            // All textures are stored as 3D, we represent our 2D texture
+            // by setting depth to 1.
+            size: wgpu::Extent3d {
+                width: 256,
+                height: 256,
+                depth_or_array_layers: 256,
+            },
+            mip_level_count: 1, // We'll talk about this a little later
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            // Most images are stored using sRGB so we need to reflect that here.
+            format: wgpu::TextureFormat::R32Uint,
+            // TEXTURE_BINDING tells wgpu that we want to use this texture in shaders
+            // COPY_DST means that we want to copy data to this texture
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            label: Some("Region texture"),
+            // This is the same as with the SurfaceConfig. It
+            // specifies what texture formats can be used to
+            // create TextureViews for this texture. The base
+            // texture format (Rgba8UnormSrgb in this case) is
+            // always supported. Note that using a different
+            // texture format is not supported on the WebGL2
+            // backend.
+            view_formats: &[],
+        });
 
-        let region_texture = device.create_texture(
-    &wgpu::TextureDescriptor {
-        // All textures are stored as 3D, we represent our 2D texture
-        // by setting depth to 1.
-        size: wgpu::Extent3d {
-            width: 256,
-            height: 256,
-            depth_or_array_layers: 256,
-        },
-        mip_level_count: 1, // We'll talk about this a little later
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D3,
-        // Most images are stored using sRGB so we need to reflect that here.
-        format: wgpu::TextureFormat::R32Uint,
-        // TEXTURE_BINDING tells wgpu that we want to use this texture in shaders
-        // COPY_DST means that we want to copy data to this texture
-        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-        label: Some("Region texture"),
-        // This is the same as with the SurfaceConfig. It
-        // specifies what texture formats can be used to
-        // create TextureViews for this texture. The base
-        // texture format (Rgba8UnormSrgb in this case) is
-        // always supported. Note that using a different
-        // texture format is not supported on the WebGL2
-        // backend.
-        view_formats: &[],
-    }
-    );
+        let region_texture_view =
+            region_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let region_texture_view = region_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group_layout_region_storage =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX
+                            | wgpu::ShaderStages::FRAGMENT
+                            | wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::R32Uint,
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX
+                            | wgpu::ShaderStages::FRAGMENT
+                            | wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: Some(NonZeroU64::new(1_000_000).unwrap()),
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::VERTEX
+                            | wgpu::ShaderStages::FRAGMENT
+                            | wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: Some(NonZeroU64::new(1_000_000).unwrap()),
+                        },
+                        count: None,
+                    },
+                ],
+                label: Some("bind_group_layout"),
+            });
+
+        let bind_group_region_storage = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &bind_group_layout_region_storage,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&region_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &data_buffer,
+                        offset: 0,
+                        size: Some(NonZeroU64::new(1_000_000).unwrap()),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &perframe_buffer,
+                        offset: 0,
+                        size: Some(NonZeroU64::new(1_000_000).unwrap()),
+                    }),
+                },
+            ],
+            label: Some("bind_group"),
+        });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX 
-                    | wgpu::ShaderStages::FRAGMENT
-                    | wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Uint,
-                    view_dimension: wgpu::TextureViewDimension::D3,
-                    multisampled: false,
-                },
-                count: None,
-            },
                 wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::VERTEX 
-                    | wgpu::ShaderStages::FRAGMENT
-                    | wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: Some(NonZeroU64::new(1_000_000).unwrap()),
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX
+                        | wgpu::ShaderStages::FRAGMENT
+                        | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::VERTEX 
-                    | wgpu::ShaderStages::FRAGMENT
-                    | wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: Some(NonZeroU64::new(1_000_000).unwrap()),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX
+                        | wgpu::ShaderStages::FRAGMENT
+                        | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: Some(NonZeroU64::new(1_000_000).unwrap()),
+                    },
+                    count: None,
                 },
-                count: None,
-            },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX
+                        | wgpu::ShaderStages::FRAGMENT
+                        | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: Some(NonZeroU64::new(1_000_000).unwrap()),
+                    },
+                    count: None,
+                },
             ],
             label: Some("bind_group_layout"),
         });
@@ -421,29 +574,35 @@ impl Graphics {
             label: Some("bind_group"),
         });
 
-        let pipeline_layout =
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline_layout_region_storage =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&bind_group_layout],
+                bind_group_layouts: &[&bind_group_layout_region_storage],
                 push_constant_ranges: &[],
             });
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-        
+
         let perframe_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: "cs_perframe",
         });
-        
+
         let build_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
-            layout: Some(&pipeline_layout),
+            layout: Some(&pipeline_layout_region_storage),
             module: &shader,
             entry_point: "cs_build",
         });
-        
+
         let setup_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
             layout: Some(&pipeline_layout),
@@ -508,6 +667,7 @@ impl Graphics {
             region_texture,
             region_texture_view,
             bind_group,
+            bind_group_region_storage,
         }
     }
 
@@ -526,7 +686,11 @@ impl Graphics {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        self.queue.write_buffer(&self.perframe_buffer, 0, bytemuck::cast_slice(&[perframe_data]));
+        self.queue.write_buffer(
+            &self.perframe_buffer,
+            0,
+            bytemuck::cast_slice(&[perframe_data]),
+        );
 
         let mut encoder = self
             .device
@@ -535,41 +699,46 @@ impl Graphics {
             });
 
         {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Compute Pass") });
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Compute Pass"),
+            });
 
             compute_pass.set_bind_group(0, &self.bind_group, &[]);
 
             compute_pass.set_pipeline(&self.perframe_pipeline);
-            compute_pass.dispatch_workgroups(1,1,1);
-
+            compute_pass.dispatch_workgroups(1, 1, 1);
         }
 
         encoder.copy_buffer_to_buffer(
-            &self.data_buffer, 
-            0, 
-            &self.indirect_buffer, 
+            &self.data_buffer,
             mem::size_of::<wgpu::util::DrawIndirect>() as u64,
-            2 * mem::size_of::<wgpu::util::DispatchIndirect>() as u64
+            &self.indirect_buffer,
+            mem::size_of::<wgpu::util::DrawIndirect>() as u64,
+            2 * mem::size_of::<wgpu::util::DispatchIndirect>() as u64,
         );
 
         {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Compute Pass") });
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Compute Pass"),
+            });
 
-            compute_pass.set_bind_group(0, &self.bind_group, &[]);
+            compute_pass.set_bind_group(0, &self.bind_group_region_storage, &[]);
 
             let mut offset = mem::size_of::<wgpu::util::DrawIndirect>() as u64;
             compute_pass.set_pipeline(&self.build_pipeline);
-            compute_pass.dispatch_workgroups_indirect(&self.indirect_buffer, offset); 
-            
+            compute_pass.dispatch_workgroups_indirect(&self.indirect_buffer, offset);
+
+            compute_pass.set_bind_group(0, &self.bind_group, &[]);
+
             offset += mem::size_of::<wgpu::util::DispatchIndirect>() as u64;
             compute_pass.set_pipeline(&self.setup_pipeline);
             compute_pass.dispatch_workgroups_indirect(&self.indirect_buffer, offset);
         }
 
         encoder.copy_buffer_to_buffer(
-            &self.data_buffer, 
-            0, 
-            &self.indirect_buffer, 
+            &self.data_buffer,
+            0,
+            &self.indirect_buffer,
             0,
             mem::size_of::<wgpu::util::DrawIndirect>() as u64,
         );
@@ -592,7 +761,7 @@ impl Graphics {
                 })],
                 depth_stencil_attachment: None,
             });
-            
+
             render_pass.set_bind_group(0, &self.bind_group, &[]);
 
             render_pass.set_pipeline(&self.render_pipeline);
