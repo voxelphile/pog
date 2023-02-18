@@ -1,4 +1,7 @@
-use cgmath::{Deg, Euler, Matrix4, PerspectiveFov, Quaternion, Rad, Vector3, InnerSpace, SquareMatrix, Vector4, Rotation3};
+use cgmath::{
+    Deg, Euler, InnerSpace, Matrix4, PerspectiveFov, Quaternion, Rad, Rotation3, SquareMatrix,
+    Vector2, Vector3, Vector4,
+};
 use std::{
     future::Future,
     mem,
@@ -38,40 +41,37 @@ struct World;
 
 impl World {
     fn update(delta_time: f32, perframe_data: &mut PerframeData) {
-
         const sens: f32 = 0.0002;
-    
-        let rot_z = Quaternion::from_angle_z(
-            Rad(perframe_data.rot_z)
-        );
-        
-        perframe_data.camera.rotation = rot_z;
-        
-        let rot_x = Quaternion::from_angle_x(
-            Rad(perframe_data.rot_x)
-        );
-        
-        perframe_data.camera.rotation = perframe_data.camera.rotation * rot_x;
 
+        let rot_z = Quaternion::from_angle_z(Rad(perframe_data.rot_z));
+
+        perframe_data.camera.rotation = rot_z;
+
+        let rot_x = Quaternion::from_angle_x(Rad(perframe_data.rot_x));
+
+        perframe_data.camera.rotation = perframe_data.camera.rotation * rot_x;
 
         let mut dx = perframe_data.right as f32 - perframe_data.left as f32;
         let mut dy = perframe_data.forward as f32 - perframe_data.backward as f32;
         let mut dz = perframe_data.up as f32 - perframe_data.down as f32;
 
-        let mut adjusted_movement = (rot_z *
-            Vector3 { x: dx, y: dy, z: 0.0 });
+        let mut adjusted_movement = (rot_z
+            * Vector3 {
+                x: dx,
+                y: dy,
+                z: 0.0,
+            });
 
         if adjusted_movement.dot(adjusted_movement) != 0.0 {
             adjusted_movement = adjusted_movement.normalize();
         }
-        
+
         dx = adjusted_movement.x;
         dy = adjusted_movement.y;
-        
+
         dx *= delta_time;
         dy *= delta_time;
         dz *= delta_time;
-
 
         perframe_data.camera.position += Vector4 {
             x: dx,
@@ -90,7 +90,7 @@ impl World {
             * Matrix4::from(
                 cgmath::PerspectiveFov::<f32> {
                     fovy: Deg(90.0).into(),
-                    aspect: perframe_data.camera.aspect_ratio,
+                    aspect: perframe_data.camera.resolution.x / perframe_data.camera.resolution.y,
                     near: 0.1,
                     far: 1000.0,
                 }
@@ -129,7 +129,7 @@ impl State {
                 inv_projection: Matrix4::<f32>::identity(),
                 position: Vector4::<f32>::new(0.0, 0.0, 10.0, 1.0),
                 rotation: Quaternion::<f32>::new(0.0, 0.0, 0.0, 0.0),
-                aspect_ratio: 0.0,
+                resolution: Vector2::<f32>::new(0.0, 0.0),
             },
             up: 0,
             down: 0,
@@ -153,13 +153,17 @@ impl State {
                 WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
                 WindowEvent::Resized(physical_size) => {
                     self.graphics.window_size = *physical_size;
-                    perframe_data.camera.aspect_ratio =
-                        physical_size.width as f32 / physical_size.height as f32;
+                    perframe_data.camera.resolution = Vector2 {
+                        x: physical_size.width as f32,
+                        y: physical_size.height as f32,
+                    };
                 }
                 WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
                     self.graphics.window_size = **new_inner_size;
-                    perframe_data.camera.aspect_ratio =
-                        new_inner_size.width as f32 / new_inner_size.height as f32;
+                    perframe_data.camera.resolution = Vector2 {
+                        x: new_inner_size.width as f32,
+                        y: new_inner_size.height as f32,
+                    };
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     if cursor_captured {
@@ -174,11 +178,12 @@ impl State {
                         self.graphics.window.set_cursor_position(
                             winit::dpi::PhysicalPosition::new(width as i32 / 2, height as i32 / 2),
                         );
-        
+
                         const SENS: f32 = 0.0002;
 
                         perframe_data.rot_x -= SENS * y_diff as f32;
-                        perframe_data.rot_x = f32::clamp(perframe_data.rot_x, 0.0, 2.0 * std::f32::consts::PI);
+                        perframe_data.rot_x =
+                            f32::clamp(perframe_data.rot_x, 0.0, 2.0 * std::f32::consts::PI);
                         perframe_data.rot_z -= SENS * x_diff as f32;
                     }
                 }
@@ -279,7 +284,7 @@ struct Camera {
     inv_projection: Matrix4<f32>,
     position: Vector4<f32>,
     rotation: Quaternion<f32>,
-    aspect_ratio: f32,
+    resolution: Vector2<f32>,
 }
 
 #[repr(C)]
@@ -319,6 +324,9 @@ struct Graphics {
     region_texture_view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
     bind_group_region_storage: wgpu::BindGroup,
+    depth_texture: wgpu::Texture,
+    depth_texture_view: wgpu::TextureView,
+    depth_texture_sampler: wgpu::Sampler,
 }
 
 impl Graphics {
@@ -610,6 +618,40 @@ impl Graphics {
             entry_point: "cs_setup",
         });
 
+        let depth_size = wgpu::Extent3d {
+            // 2.
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        };
+        let depth_desc = wgpu::TextureDescriptor {
+            label: Some("Depth Texture"),
+            size: depth_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT // 3.
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[wgpu::TextureFormat::Depth32Float],
+        };
+        let depth_texture = device.create_texture(&depth_desc);
+
+        let depth_texture_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth_texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            // 4.
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            compare: Some(wgpu::CompareFunction::LessEqual), // 5.
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 100.0,
+            ..Default::default()
+        });
+
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             layout: Some(&pipeline_layout),
@@ -641,7 +683,13 @@ impl Graphics {
                 // Requires Features::CONSERVATIVE_RASTERIZATION
                 conservative: false,
             },
-            depth_stencil: None, // 1.
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less, // 1.
+                stencil: wgpu::StencilState::default(),     // 2.
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState {
                 count: 1,                         // 2.
                 mask: !0,                         // 3.
@@ -668,6 +716,9 @@ impl Graphics {
             region_texture_view,
             bind_group,
             bind_group_region_storage,
+            depth_texture,
+            depth_texture_view,
+            depth_texture_sampler,
         }
     }
 
@@ -676,6 +727,41 @@ impl Graphics {
             self.config.width = self.window_size.width;
             self.config.height = self.window_size.height;
             self.surface.configure(&self.device, &self.config);
+            let depth_size = wgpu::Extent3d {
+                // 2.
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            };
+            let depth_desc = wgpu::TextureDescriptor {
+                label: Some("Depth Texture"),
+                size: depth_size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT // 3.
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[wgpu::TextureFormat::Depth32Float],
+            };
+            self.depth_texture = self.device.create_texture(&depth_desc);
+
+            self.depth_texture_view = self
+                .depth_texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            self.depth_texture_sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+                // 4.
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::FilterMode::Nearest,
+                compare: Some(wgpu::CompareFunction::LessEqual), // 5.
+                lod_min_clamp: 0.0,
+                lod_max_clamp: 100.0,
+                ..Default::default()
+            });
         }
     }
 
@@ -759,7 +845,14 @@ impl Graphics {
                         store: true,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_texture_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: true,
+                    }),
+                    stencil_ops: None,
+                }),
             });
 
             render_pass.set_bind_group(0, &self.bind_group, &[]);
