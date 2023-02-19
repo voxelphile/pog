@@ -21,9 +21,8 @@ use winit::{
     window::WindowBuilder,
 };
 
-pub const REGION_SIZE: u32 = 512;
-pub const CHUNK_VOLUME: u32 = 256;
-pub const CHUNK_SIZE: u32 = 8;
+pub const REGION_SIZE: u32 = 256;
+pub const CHUNK_SIZE: u32 = 4;
 
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
@@ -108,7 +107,7 @@ impl World {
         dx = adjusted_movement.x;
         dy = adjusted_movement.y;
 
-        const SPEED: f32 = 60.0;
+        const SPEED: f32 = 6.0;
 
         dx *= SPEED * delta_time;
         dy *= SPEED * delta_time;
@@ -124,7 +123,15 @@ impl World {
         perframe_data.camera.position[3] = 1.0;
 
         perframe_data.camera.transform = perframe_data.camera.rotation.into();
-        perframe_data.camera.transform[3] = Vector4 { x: 256.0, y: 256.0, z: 256.0, w: 1.0 };
+        perframe_data.camera.transform[3] = Vector4 { 
+            x: REGION_SIZE as f32 / 2.0 
+                + CHUNK_SIZE as f32 * f32::fract(perframe_data.camera.position.x / CHUNK_SIZE as f32 - 0.5), 
+            y: REGION_SIZE as f32 / 2.0 
+                + CHUNK_SIZE as f32 * f32::fract(perframe_data.camera.position.y / CHUNK_SIZE as f32 - 0.5), 
+            z: REGION_SIZE as f32 / 2.0 
+                + CHUNK_SIZE as f32 * f32::fract(perframe_data.camera.position.z / CHUNK_SIZE as f32 - 0.5), 
+            w: 1.0 
+        };
 
         perframe_data.camera.view = perframe_data.camera.transform.invert().unwrap();
 
@@ -169,7 +176,7 @@ impl State {
                 view: Matrix4::<f32>::identity(),
                 projection: Matrix4::<f32>::identity(),
                 inv_projection: Matrix4::<f32>::identity(),
-                position: Vector4::<f32>::new(0.0, 0.0, 40.0, 1.0),
+                position: Vector4::<f32>::new(0.0, 0.0, 0.0, 1.0),
                 rotation: Quaternion::<f32>::new(0.0, 0.0, 0.0, 0.0),
                 resolution: Vector2::<f32>::new(0.0, 0.0),
             },

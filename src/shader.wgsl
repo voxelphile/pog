@@ -1,3 +1,5 @@
+const chunk_size = 4;
+const region_size = 256;
 
 struct Camera {
 	transform: mat4x4<f32>,
@@ -53,8 +55,8 @@ struct ChunkData {
 
 @group(0) @binding(3) var<storage, read_write> chunk_buffer : ChunkData;
 
-fn world_gen(region_position: vec3<i32>) -> u32 {
-	if(region_position.z < 20) {
+fn world_gen(position: vec3<f32>) -> u32 {
+	if(position.z < 20.0) {
 		return u32(1);
 	}
 	return u32(0);
@@ -63,7 +65,7 @@ fn world_gen(region_position: vec3<i32>) -> u32 {
 @compute
 @workgroup_size(1)
 fn cs_perframe() {
-	var size: vec3<i32> = vec3<i32>(512);
+	var size: vec3<i32> = vec3<i32>(region_size);
 	
 	if(global_buffer.load == 0 || true) {
 		indirect_buffer.draw_vertex_count = u32(36);
@@ -71,9 +73,9 @@ fn cs_perframe() {
 		indirect_buffer.draw_base_vertex = u32(0);
 		indirect_buffer.draw_base_instance = u32(0);
 
-		indirect_buffer.create_chunk_x = u32(size.x / 8);
-		indirect_buffer.create_chunk_y = u32(size.y / 8);
-		indirect_buffer.create_chunk_z = u32(size.z / 8);
+		indirect_buffer.create_chunk_x = u32(size.x / chunk_size);
+		indirect_buffer.create_chunk_y = u32(size.y / chunk_size);
+		indirect_buffer.create_chunk_z = u32(size.z / chunk_size);
 	} else {
 		indirect_buffer.create_chunk_x = u32(0);
 		indirect_buffer.create_chunk_y = u32(0);
@@ -83,35 +85,34 @@ fn cs_perframe() {
 	global_buffer.load = 1;
 }
 
+var<workgroup> solid_blocks: atomic<i32>;
+
 @compute
-@workgroup_size(1)
-fn cs_create_chunks(@builtin(global_invocation_id) gid: vec3<u32>) {
-	var size: vec3<i32> = vec3<i32>(512 / 8);
+@workgroup_size(4, 4, 4)
+fn cs_create_chunks(
+	@builtin(global_invocation_id) gid: vec3<u32>,
+	@builtin(local_invocation_index) lid : u32
+) {
+	var size: vec3<i32> = vec3<i32>(region_size / chunk_size);
 	
 	var empty = true;
 
-	var chunk_pos = 8 * vec3<i32>(gid);
+	var voxel_pos = vec3<i32>(gid);
 
-	for(var x = 0; x < 8 && empty; x++) {
-		for(var y = 0; y < 8 && empty; y++) {
-			for(var z = 0; z < 8 && empty; z++) {
-				var voxel_pos = chunk_pos + vec3<i32>(x,y,z);
-				var block_id = world_gen(voxel_pos 
-				+ vec3<i32>(
-					perframe_buffer.camera.position.xyz
-				));
+	var block_id = world_gen(
+		vec3<f32>(voxel_pos)
+		+ perframe_buffer.camera.position.xyz
+	);
 
-				if(block_id != u32(0)) {
-					empty = false;
-					break;
-				}
-			}
-		}
+	if(block_id != u32(0)) {
+		solid_blocks += 1;
 	}
 
-	if(!empty) {
+	workgroupBarrier();
+
+	if(lid == u32(0) && solid_blocks != 0) {
 		var instance = atomicAdd(&indirect_buffer.draw_instance_count, u32(1));
-		chunk_buffer.chunks[instance].position = vec4(chunk_pos, 1); 
+		chunk_buffer.chunks[instance].position = vec4(voxel_pos, 1); 
 	}
 }
 
@@ -161,9 +162,9 @@ fn vs_main(
 	var out: VertexOutput;
 
 	out.chunk_normal = vec4(normals[j / u32(6)], 0.0);
-	out.local_position = vec4(8.0 * offsets[indices[j]], 1.0);
+	out.local_position = vec4(f32(chunk_size) * offsets[indices[j]], 1.0);
 
-	out.chunk_position = vec4<f32>(8.0 * vec3<f32>(chunk_buffer.chunks[i].position.xyz), 1.0);
+	out.chunk_position = vec4<f32>(f32(chunk_size) * vec3<f32>(chunk_buffer.chunks[i].position.xyz), 1.0);
 
 	out.world_position = vec4<f32>(out.local_position.xyz + out.chunk_position.xyz, 1.0);
     	out.clip_position = perframe_buffer.camera.projection * perframe_buffer.camera.view * out.world_position;
@@ -281,20 +282,15 @@ fn ray_cast_check_out_of_bounds(state: ptr<function, RayState>, fluff: i32) -> b
 
 fn ray_cast_check_failure(state: ptr<function, RayState>) -> bool {
 	return ray_cast_check_over_dist(state) 
-		|| ray_cast_check_out_of_bounds(state, 1) 
+		|| ray_cast_check_out_of_bounds(state, 0) 
 		|| ray_cast_check_over_step_count(state);
 }
 
 fn ray_cast_check_success(state: ptr<function, RayState>) -> bool {
-	if(ray_cast_check_out_of_bounds(state, 0)) {
-		(*state).id = RAY_STATE_INITIAL;
-		return false;
-	}
 	
-	var block_id = world_gen((*state).position 
-	+ vec3<i32>(
-		perframe_buffer.camera.position.xyz
-	));
+	var block_id = world_gen(vec3<f32>((*state).position)
+		+ perframe_buffer.camera.position.xyz
+	);
 
 	if(block_id == u32(0)) {
 		(*state).id = RAY_STATE_VOXEL_FOUND;
@@ -388,12 +384,13 @@ fn fs_main(
 	in: VertexOutput,
 ) -> @location(0) vec4<f32> {
 	var ray: Ray;
-	ray.origin = in.chunk_position.xyz + in.local_position.xyz;
+	ray.origin = in.chunk_position.xyz + in.local_position.xyz + 1e-2 * vec3<f32>(in.chunk_normal.xyz);
 	ray.offset = perframe_buffer.camera.position.xyz;
-	ray.direction = normalize(ray.origin - perframe_buffer.camera.position.xyz);
+	ray.direction = normalize(ray.origin - vec3<f32>(f32(region_size) / 2.0));
 	ray.max_distance = 1000.0;
-	ray.minimum = vec3<i32>(in.chunk_position.xyz);
-	ray.maximum = vec3<i32>(in.chunk_position.xyz) + 8;
+	// TODO see if I can eliminate the fluff?
+	ray.minimum = vec3<i32>(in.chunk_position.xyz) - 1;
+	ray.maximum = vec3<i32>(in.chunk_position.xyz) + chunk_size + 1;
 
 	var ray_state = ray_cast_start(ray);
 
@@ -403,11 +400,11 @@ fn fs_main(
 		}
 	}
 
+	var ray_hit = ray_cast_complete(ray_state);
+
 	if(ray_state.id == RAY_STATE_OUT_OF_BOUNDS) {
 		discard;
 	}
-
-	var ray_hit = ray_cast_complete(ray_state);
 
 	var result = vec4(1.0);
 
@@ -424,5 +421,5 @@ fn fs_main(
 	
 	result *= vec4(vec3(0.75 + 0.25 * mix(mix(ambient.z, ambient.w, ray_hit.uv.x), mix(ambient.y, ambient.x, ray_hit.uv.x), ray_hit.uv.y)), 1.0);*/
 
-	return vec4(ray_hit.destination % 8.0 / 8.0, 1.0);	
+	return vec4(ray_hit.destination % f32(chunk_size) / f32(chunk_size), 1.0);	
 }
