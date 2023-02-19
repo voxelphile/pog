@@ -1,13 +1,3 @@
-@group(0) @binding(0)
-var region_texture: texture_3d<u32>;
-
-struct ChunkData {
-	chunk_positions: array<vec4<u32>>,
-};
-
-
-@group(0) @binding(1) var<storage> internal_chunk_buffer : ChunkData;
-@group(0) @binding(2) var<storage> chunk_buffer : ChunkData;
 
 struct Camera {
 	transform: mat4x4<f32>,
@@ -33,20 +23,105 @@ struct PerframeData {
 	look_y: f32,
 };
 
-@group(0) @binding(3) var<storage> perframe_buffer : PerframeData;
+@group(0) @binding(0) var<storage> perframe_buffer : PerframeData;
+
+struct IndirectData {
+	draw_vertex_count: u32,
+    	draw_instance_count: atomic<u32>,
+    	draw_base_vertex: u32,
+    	draw_base_instance: u32,
+	create_chunk_x: u32,
+	create_chunk_y: u32,
+	create_chunk_z: u32,
+}
+
+@group(0) @binding(1) var<storage, read_write> indirect_buffer : IndirectData;
+
+struct GlobalData {
+	load: i32,
+}
+
+@group(0) @binding(2) var<storage, read_write> global_buffer : GlobalData;
+
+struct Chunk {
+	position: vec4<i32>,
+}
+
+struct ChunkData {
+	chunks: array<Chunk>,
+};
+
+@group(0) @binding(3) var<storage, read_write> chunk_buffer : ChunkData;
+
+fn world_gen(region_position: vec3<i32>) -> u32 {
+	if(region_position.z < 20) {
+		return u32(1);
+	}
+	return u32(0);
+}
 
 @compute
 @workgroup_size(1)
 fn cs_perframe() {
+	var size: vec3<i32> = vec3<i32>(512);
+	
+	if(global_buffer.load == 0 || true) {
+		indirect_buffer.draw_vertex_count = u32(36);
+		indirect_buffer.draw_instance_count = u32(0);
+		indirect_buffer.draw_base_vertex = u32(0);
+		indirect_buffer.draw_base_instance = u32(0);
+
+		indirect_buffer.create_chunk_x = u32(size.x / 8);
+		indirect_buffer.create_chunk_y = u32(size.y / 8);
+		indirect_buffer.create_chunk_z = u32(size.z / 8);
+	} else {
+		indirect_buffer.create_chunk_x = u32(0);
+		indirect_buffer.create_chunk_y = u32(0);
+		indirect_buffer.create_chunk_z = u32(0);
+	}
+
+	global_buffer.load = 1;
 }
+
+@compute
+@workgroup_size(1)
+fn cs_create_chunks(@builtin(global_invocation_id) gid: vec3<u32>) {
+	var size: vec3<i32> = vec3<i32>(512 / 8);
+	
+	var empty = true;
+
+	var chunk_pos = 8 * vec3<i32>(gid);
+
+	for(var x = 0; x < 8 && empty; x++) {
+		for(var y = 0; y < 8 && empty; y++) {
+			for(var z = 0; z < 8 && empty; z++) {
+				var voxel_pos = chunk_pos + vec3<i32>(x,y,z);
+				var block_id = world_gen(voxel_pos 
+				+ vec3<i32>(
+					perframe_buffer.camera.position.xyz
+				));
+
+				if(block_id != u32(0)) {
+					empty = false;
+					break;
+				}
+			}
+		}
+	}
+
+	if(!empty) {
+		var instance = atomicAdd(&indirect_buffer.draw_instance_count, u32(1));
+		chunk_buffer.chunks[instance].position = vec4(chunk_pos, 1); 
+	}
+}
+
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) world_position: vec4<f32>,
-    @location(1) chunk_position: vec4<f32>,
-    @location(2) internal_chunk_position: vec4<f32>,
+    @location(1) @interpolate(flat) chunk_position: vec4<f32>,
     @location(3) local_position: vec4<f32>,
-    @location(4) chunk_normal: vec4<f32>,
+    @location(4) @interpolate(flat) chunk_normal: vec4<f32>,
 };
 
 @vertex
@@ -88,8 +163,7 @@ fn vs_main(
 	out.chunk_normal = vec4(normals[j / u32(6)], 0.0);
 	out.local_position = vec4(8.0 * offsets[indices[j]], 1.0);
 
-	out.internal_chunk_position = vec4<f32>(8.0 * vec3<f32>(internal_chunk_buffer.chunk_positions[i].xyz), 1.0);
-	out.chunk_position = vec4<f32>(8.0 * vec3<f32>(chunk_buffer.chunk_positions[i].xyz), 1.0);
+	out.chunk_position = vec4<f32>(8.0 * vec3<f32>(chunk_buffer.chunks[i].position.xyz), 1.0);
 
 	out.world_position = vec4<f32>(out.local_position.xyz + out.chunk_position.xyz, 1.0);
     	out.clip_position = perframe_buffer.camera.projection * perframe_buffer.camera.view * out.world_position;
@@ -105,9 +179,10 @@ const RAY_STATE_VOXEL_FOUND = 4;
 
 struct Ray {
 	origin: vec3<f32>,
+	offset: vec3<f32>,
 	direction: vec3<f32>,
-	minimum: vec3<f32>,
-	maximum: vec3<f32>,
+	minimum: vec3<i32>,
+	maximum: vec3<i32>,
 	max_distance: f32,
 }
 
@@ -188,15 +263,13 @@ fn ray_cast_check_over_dist(state: ptr<function, RayState>) -> bool {
 	return false;
 }
 
-fn ray_cast_check_out_of_bounds(state: ptr<function, RayState>) -> bool {
-	var destination = (*state).ray.origin + (*state).ray.direction * (*state).dist;
-
-	var in_bounds = destination.x >= (*state).ray.minimum.x 
-		&& destination.y >= (*state).ray.minimum.y
-		&& destination.z >= (*state).ray.minimum.z
-		&& destination.x < (*state).ray.maximum.x
-		&& destination.y < (*state).ray.maximum.y
-		&& destination.z < (*state).ray.maximum.z;
+fn ray_cast_check_out_of_bounds(state: ptr<function, RayState>, fluff: i32) -> bool {
+	var in_bounds = (*state).position.x >= (*state).ray.minimum.x - fluff 
+		&& (*state).position.y >= (*state).ray.minimum.y - fluff
+		&& (*state).position.z >= (*state).ray.minimum.z - fluff
+		&& (*state).position.x < (*state).ray.maximum.x + fluff
+		&& (*state).position.y < (*state).ray.maximum.y + fluff
+		&& (*state).position.z < (*state).ray.maximum.z + fluff;
 
 	if(!in_bounds) {
 		(*state).id = RAY_STATE_OUT_OF_BOUNDS;
@@ -208,18 +281,31 @@ fn ray_cast_check_out_of_bounds(state: ptr<function, RayState>) -> bool {
 
 fn ray_cast_check_failure(state: ptr<function, RayState>) -> bool {
 	return ray_cast_check_over_dist(state) 
-		|| ray_cast_check_out_of_bounds(state) 
+		|| ray_cast_check_out_of_bounds(state, 1) 
 		|| ray_cast_check_over_step_count(state);
 }
 
 fn ray_cast_check_success(state: ptr<function, RayState>) -> bool {
-	var block_id = textureLoad(region_texture, (*state).position, 0).x;
+	if(ray_cast_check_out_of_bounds(state, 0)) {
+		(*state).id = RAY_STATE_INITIAL;
+		return false;
+	}
+	
+	var block_id = world_gen((*state).position 
+	+ vec3<i32>(
+		perframe_buffer.camera.position.xyz
+	));
 
-	if(block_id != u32(0)) {
+	if(block_id == u32(0)) {
 		(*state).id = RAY_STATE_VOXEL_FOUND;
 		(*state).block_id = block_id;
 		return true;
 	}
+
+/*
+	var block_id = textureLoad(region_texture, (*state).position, 0).x;
+
+*/
 
 	return false;
 }
@@ -238,11 +324,11 @@ fn ray_cast_drive(state: ptr<function, RayState>) -> bool {
 		return true;
 	}
 	
-	if(ray_cast_check_success(state)) {
+	if(ray_cast_check_failure(state)) {
 		return true;
 	}
-
-	if(ray_cast_check_failure(state)) {
+	
+	if(ray_cast_check_success(state)) {
 		return true;
 	}
 
@@ -256,7 +342,7 @@ fn vertex_ao(side: vec2<f32>, corner: f32) -> f32 {
 }
 
 fn voxel_query(position: vec3<i32>) -> bool {
-	var block_id = textureLoad(region_texture, position, 0).x;
+	var block_id = u32(0); //world_gen(position);
 
 	if(block_id != u32(0)) {
 		return true;
@@ -301,18 +387,13 @@ fn voxel_ao(position: vec3<i32>, d1: vec3<i32>, d2: vec3<i32>) -> vec4<f32> {
 fn fs_main(
 	in: VertexOutput,
 ) -> @location(0) vec4<f32> {
-	if(true) {
-	}
-	var false_origin = in.internal_chunk_position.xyz + in.local_position.xyz;
-	var true_origin = in.chunk_position.xyz + in.local_position.xyz;
-	var direction = normalize(true_origin - perframe_buffer.camera.position.xyz);
-
 	var ray: Ray;
-	ray.origin = false_origin;
-	ray.direction = direction;
+	ray.origin = in.chunk_position.xyz + in.local_position.xyz;
+	ray.offset = perframe_buffer.camera.position.xyz;
+	ray.direction = normalize(ray.origin - perframe_buffer.camera.position.xyz);
 	ray.max_distance = 1000.0;
-	ray.minimum = vec3<f32>(in.internal_chunk_position.xyz) + 5e-2;
-	ray.maximum = vec3<f32>(in.internal_chunk_position.xyz) + 8.0 - 5e-2;
+	ray.minimum = vec3<i32>(in.chunk_position.xyz);
+	ray.maximum = vec3<i32>(in.chunk_position.xyz) + 8;
 
 	var ray_state = ray_cast_start(ray);
 
@@ -334,13 +415,14 @@ fn fs_main(
 		result *= vec4(1.0, 0.0, 0.0, 1.0);	
 	}
 
+/*
 	var ambient = voxel_ao(
 		ray_hit.back_step, 
 		abs(ray_hit.normal.zxy), 
 		abs(ray_hit.normal.yzx)
 	);
 	
-	result *= vec4(vec3(0.75 + 0.25 * mix(mix(ambient.z, ambient.w, ray_hit.uv.x), mix(ambient.y, ambient.x, ray_hit.uv.x), ray_hit.uv.y)), 1.0);
+	result *= vec4(vec3(0.75 + 0.25 * mix(mix(ambient.z, ambient.w, ray_hit.uv.x), mix(ambient.y, ambient.x, ray_hit.uv.x), ray_hit.uv.y)), 1.0);*/
 
-	return vec4(false_origin % 8.0 / 8.0, 1.0);	
+	return vec4(ray_hit.destination % 8.0 / 8.0, 1.0);	
 }

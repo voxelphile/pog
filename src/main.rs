@@ -108,7 +108,7 @@ impl World {
         dx = adjusted_movement.x;
         dy = adjusted_movement.y;
 
-        const SPEED: f32 = 6.0;
+        const SPEED: f32 = 60.0;
 
         dx *= SPEED * delta_time;
         dy *= SPEED * delta_time;
@@ -120,10 +120,11 @@ impl World {
             z: dz,
             w: 0.0,
         };
+        dbg!(perframe_data.camera.position);
         perframe_data.camera.position[3] = 1.0;
 
         perframe_data.camera.transform = perframe_data.camera.rotation.into();
-        perframe_data.camera.transform[3] = perframe_data.camera.position;
+        perframe_data.camera.transform[3] = Vector4 { x: 256.0, y: 256.0, z: 256.0, w: 1.0 };
 
         perframe_data.camera.view = perframe_data.camera.transform.invert().unwrap();
 
@@ -361,18 +362,16 @@ struct Graphics {
     window: Window,
     render_pipeline: wgpu::RenderPipeline,
     perframe_pipeline: wgpu::ComputePipeline,
-    internal_chunk_buffer: wgpu::Buffer,
+    create_chunk_pipeline: wgpu::ComputePipeline,
     chunk_buffer: wgpu::Buffer,
+    global_buffer: wgpu::Buffer,
+    modify_indirect_buffer: wgpu::Buffer,
+    indirect_buffer: wgpu::Buffer,
     perframe_buffer: wgpu::Buffer,
-    region_buffer: wgpu::Buffer,
-    region_texture: wgpu::Texture,
-    region_texture_view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
     depth_texture: wgpu::Texture,
     depth_texture_view: wgpu::TextureView,
     depth_texture_sampler: wgpu::Sampler,
-    copied_region_data: bool,
-    chunk_count: u32,
 }
 
 impl Graphics {
@@ -448,144 +447,33 @@ impl Graphics {
             mapped_at_creation: false,
         });
 
-        const CHUNK_COUNT: u32 = REGION_SIZE / CHUNK_SIZE;
-
-        let mut chunk_count = 0;
-        let mut chunk_positions = Vec::<[u32; 4]>::new();
-        let mut internal_chunk_positions = Vec::<[u32; 4]>::new();
-
-        let world_data = World::generate();
-        let mut gpu_world_data = vec![0u32; CHUNK_VOLUME.pow(3) as usize];
-
-        'a: for i in 0..CHUNK_COUNT.pow(3) as usize {
-            if chunk_count >= CHUNK_COUNT.pow(3) {
-                println!("chunk count more than maximum chunks in volume");
-                break;
-            }
-
-            let mut chunk_idx = i as u32;
-            let mut chunk_pos = Vector3 { x: 0, y: 0, z: 0 };
-            chunk_pos.z = chunk_idx / CHUNK_COUNT.pow(2) as u32;
-            chunk_idx -= chunk_pos.z * CHUNK_COUNT.pow(2) as u32;
-            chunk_pos.y = chunk_idx / CHUNK_COUNT;
-            chunk_pos.x = chunk_idx % CHUNK_COUNT;
-
-            let mut empty = true;
-
-            'b: for x in 0..CHUNK_SIZE {
-                for y in 0..CHUNK_SIZE {
-                    for z in 0..CHUNK_SIZE {
-                        let voxel_pos = CHUNK_SIZE * chunk_pos + Vector3 { x, y, z };
-
-                        let voxel_idx = (voxel_pos.z * REGION_SIZE * REGION_SIZE)
-                            + (voxel_pos.y * REGION_SIZE)
-                            + voxel_pos.x;
-
-                        if world_data[voxel_idx as usize] != 0u32 {
-                            empty = false;
-                            break 'b;
-                        }
-                    }
-                }
-            }
-
-            if !empty {
-                const CHUNK_COUNT2: u32 = CHUNK_VOLUME / CHUNK_SIZE;
-                let mut chunk_idx2 = chunk_count as u32;
-                let mut chunk_pos2 = Vector3 { x: 0, y: 0, z: 0 };
-                chunk_pos2.z = chunk_idx2 / CHUNK_COUNT2.pow(2) as u32;
-                chunk_idx2 -= chunk_pos2.z * CHUNK_COUNT2.pow(2) as u32;
-                chunk_pos2.y = chunk_idx2 / CHUNK_COUNT2;
-                chunk_pos2.x = chunk_idx2 % CHUNK_COUNT2;
-
-                chunk_positions.push(Vector4 {
-                    x: chunk_pos.x,
-                    y: chunk_pos.y,
-                    z: chunk_pos.z,
-                    w: 1
-                }.into());
-                internal_chunk_positions.push(Vector4 {
-                    x: chunk_pos2.x,
-                    y: chunk_pos2.y,
-                    z: chunk_pos2.z,
-                    w: 1,
-                }.into());
-
-                for x in 0..CHUNK_SIZE {
-                    for y in 0..CHUNK_SIZE {
-                        for z in 0..CHUNK_SIZE {
-                            let voxel_pos = CHUNK_SIZE * chunk_pos + Vector3 { x, y, z };
-
-                            let voxel_idx = (voxel_pos.z * REGION_SIZE * REGION_SIZE)
-                                + (voxel_pos.y * REGION_SIZE)
-                                + voxel_pos.x;
-
-                            let voxel_chunk_pos = CHUNK_SIZE * chunk_pos2 + Vector3 { x, y, z };
-
-                            let chunk_idx3 = (voxel_chunk_pos.z * CHUNK_VOLUME * CHUNK_VOLUME)
-                                + (voxel_chunk_pos.y * CHUNK_VOLUME)
-                                + voxel_chunk_pos.x;
-
-                            if chunk_idx3 >= gpu_world_data.len() as u32 {
-                                println!("chunk out of bounds");
-                                break 'a;
-                            }
-
-                            gpu_world_data[chunk_idx3 as usize] = world_data[voxel_idx as usize];
-                        }
-                    }
-                }
-                chunk_count += 1;
-            }
-        }
-
-        let region_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Data Buffer"),
-            contents: bytemuck::cast_slice(&gpu_world_data),
-            usage: wgpu::BufferUsages::COPY_SRC,
+        let indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Indirect Buffer"),
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            size: 1_000_000,
+            mapped_at_creation: false,
         });
-
-        let internal_chunk_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Ichunk Buffer"),
-            contents: bytemuck::cast_slice(&internal_chunk_positions),
+        
+        let modify_indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Modify Indirect Buffer"),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            size: 1_000_000,
+            mapped_at_creation: false,
+        });
+        
+        let global_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Global Buffer"),
             usage: wgpu::BufferUsages::STORAGE,
+            size: 1_000_000,
+            mapped_at_creation: false,
         });
-
-        let chunk_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        
+        let chunk_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Chunk Buffer"),
-            contents: bytemuck::cast_slice(&chunk_positions),
             usage: wgpu::BufferUsages::STORAGE,
+            size: 10_000_000,
+            mapped_at_creation: false,
         });
-
-        let region_texture = device.create_texture(&wgpu::TextureDescriptor {
-            // All textures are stored as 3D, we represent our 2D texture
-            // by setting depth to 1.
-            size: wgpu::Extent3d {
-                width: CHUNK_VOLUME,
-                height: CHUNK_VOLUME,
-                depth_or_array_layers: CHUNK_VOLUME,
-            },
-            mip_level_count: 1, // We'll talk about this a little later
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D3,
-            // Most images are stored using sRGB so we need to reflect that here.
-            format: wgpu::TextureFormat::R32Uint,
-            // TEXTURE_BINDING tells wgpu that we want to use this texture in shaders
-            // COPY_DST means that we want to copy data to this texture
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            label: Some("Region texture"),
-            // This is the same as with the SurfaceConfig. It
-            // specifies what texture formats can be used to
-            // create TextureViews for this texture. The base
-            // texture format (Rgba8UnormSrgb in this case) is
-            // always supported. Note that using a different
-            // texture format is not supported on the WebGL2
-            // backend.
-            view_formats: &[],
-        });
-
-        let region_texture_view =
-            region_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
@@ -594,10 +482,10 @@ impl Graphics {
                     visibility: wgpu::ShaderStages::VERTEX
                         | wgpu::ShaderStages::FRAGMENT
                         | wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Uint,
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: Some(NonZeroU64::new(1_000_000).unwrap()),
                     },
                     count: None,
                 },
@@ -607,15 +495,9 @@ impl Graphics {
                         | wgpu::ShaderStages::FRAGMENT
                         | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
-                        min_binding_size: Some(
-                            NonZeroU64::new(
-                                internal_chunk_positions.len() as u64
-                                    * mem::size_of_val(&internal_chunk_positions[0]) as u64,
-                            )
-                            .unwrap(),
-                        ),
+                        min_binding_size: Some(NonZeroU64::new(1_000_000).unwrap()),
                     },
                     count: None,
                 },
@@ -625,15 +507,9 @@ impl Graphics {
                         | wgpu::ShaderStages::FRAGMENT
                         | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
-                        min_binding_size: Some(
-                            NonZeroU64::new(
-                                chunk_positions.len() as u64
-                                    * mem::size_of_val(&chunk_positions[0]) as u64,
-                            )
-                            .unwrap(),
-                        ),
+                        min_binding_size: Some(NonZeroU64::new(1_000_000).unwrap()),
                     },
                     count: None,
                 },
@@ -643,7 +519,7 @@ impl Graphics {
                         | wgpu::ShaderStages::FRAGMENT
                         | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
                         min_binding_size: Some(NonZeroU64::new(1_000_000).unwrap()),
                     },
@@ -658,40 +534,32 @@ impl Graphics {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&region_texture_view),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &perframe_buffer,
+                        offset: 0,
+                        size: Some(NonZeroU64::new(1_000_000).unwrap()),
+                    }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &internal_chunk_buffer,
+                        buffer: &modify_indirect_buffer,
                         offset: 0,
-                        size: Some(
-                            NonZeroU64::new(
-                                internal_chunk_positions.len() as u64
-                                    * mem::size_of_val(&internal_chunk_positions[0]) as u64,
-                            )
-                            .unwrap(),
-                        ),
+                        size: Some(NonZeroU64::new(1_000_000).unwrap()),
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &chunk_buffer,
+                        buffer: &global_buffer,
                         offset: 0,
-                        size: Some(
-                            NonZeroU64::new(
-                                chunk_positions.len() as u64
-                                    * mem::size_of_val(&chunk_positions[0]) as u64,
-                            )
-                            .unwrap(),
-                        ),
+                        size: Some(NonZeroU64::new(1_000_000).unwrap()),
                     }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &perframe_buffer,
+                        buffer: &chunk_buffer,
                         offset: 0,
                         size: Some(NonZeroU64::new(1_000_000).unwrap()),
                     }),
@@ -713,6 +581,13 @@ impl Graphics {
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: "cs_perframe",
+        });
+        
+        let create_chunk_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: "cs_create_chunks",
         });
 
         let depth_size = wgpu::Extent3d {
@@ -804,18 +679,16 @@ impl Graphics {
             window_size,
             render_pipeline,
             perframe_pipeline,
+            create_chunk_pipeline,
             perframe_buffer,
-            internal_chunk_buffer,
+            indirect_buffer,
+            modify_indirect_buffer,
+            global_buffer,
             chunk_buffer,
-            region_buffer,
-            region_texture,
-            region_texture_view,
             bind_group,
             depth_texture,
             depth_texture_view,
             depth_texture_sampler,
-            copied_region_data: false,
-            chunk_count,
         }
     }
 
@@ -892,31 +765,33 @@ impl Graphics {
             compute_pass.dispatch_workgroups(1, 1, 1);
         }
 
-        if !self.copied_region_data {
-            self.copied_region_data = true;
+        encoder.copy_buffer_to_buffer(
+            &self.modify_indirect_buffer,
+            mem::size_of::<wgpu::util::DrawIndirect>() as u64,
+            &self.indirect_buffer,
+            mem::size_of::<wgpu::util::DrawIndirect>() as u64,
+            mem::size_of::<wgpu::util::DispatchIndirect>() as u64,
+        );
 
-            encoder.copy_buffer_to_texture(
-                wgpu::ImageCopyBuffer {
-                    buffer: &self.region_buffer,
-                    layout: wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: NonZeroU32::new(4 * CHUNK_VOLUME),
-                        rows_per_image: NonZeroU32::new(CHUNK_VOLUME),
-                    },
-                },
-                wgpu::ImageCopyTexture {
-                    texture: &self.region_texture,
-                    mip_level: 0,
-                    aspect: wgpu::TextureAspect::All,
-                    origin: wgpu::Origin3d::ZERO,
-                },
-                wgpu::Extent3d {
-                    width: CHUNK_VOLUME,
-                    height: CHUNK_VOLUME,
-                    depth_or_array_layers: CHUNK_VOLUME,
-                },
-            );
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Compute Pass"),
+            });
+
+            compute_pass.set_bind_group(0, &self.bind_group, &[]);
+
+            let mut offset = mem::size_of::<wgpu::util::DrawIndirect>() as u64;
+            compute_pass.set_pipeline(&self.create_chunk_pipeline);
+            compute_pass.dispatch_workgroups_indirect(&self.indirect_buffer, offset);
         }
+
+        encoder.copy_buffer_to_buffer(
+            &self.modify_indirect_buffer,
+            0,
+            &self.indirect_buffer,
+            0,
+            mem::size_of::<wgpu::util::DrawIndirect>() as u64,
+        );
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -947,7 +822,7 @@ impl Graphics {
             render_pass.set_bind_group(0, &self.bind_group, &[]);
 
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.draw(0..36, 0..self.chunk_count);
+            render_pass.draw_indirect(&self.indirect_buffer, 0);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
