@@ -3,7 +3,7 @@ use cgmath::{
     Deg, Euler, InnerSpace, Matrix4, PerspectiveFov, Quaternion, Rad, Rotation3, SquareMatrix,
     Vector2, Vector3, Vector4,
 };
-use noise::{NoiseFn, Perlin, Seedable};
+use noise::{NoiseFn, Simplex, Seedable};
 use std::{
     future::Future,
     mem,
@@ -21,8 +21,10 @@ use winit::{
     window::WindowBuilder,
 };
 
-pub const REGION_SIZE: u32 = 256;
+pub const REGION_SIZE: u32 = 128;
+pub const FIELD_SIZE: u32 = 256;
 pub const CHUNK_SIZE: u32 = 4;
+pub const MAX_BATCHES: u32 = 10;
 
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
@@ -46,38 +48,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct World;
 
 impl World {
-    fn generate() -> Vec<u32> {
-        let mut data = vec![0u32; (REGION_SIZE * REGION_SIZE * REGION_SIZE) as usize];
-
-        let perlin = Perlin::new(1);
-
-        for x in 0..REGION_SIZE {
-            for y in 0..REGION_SIZE {
-                const OCTAVES: usize = 8;
-                let lacunarity = 2.0;
-                let gain = 0.8;
-                let mut amplitude = 20.0;
-                let mut frequency = 0.001;
-                let mut height = 0.0;
-                for _ in 0..OCTAVES {
-                    height += amplitude
-                        * (perlin.get([frequency * x as f64, frequency * y as f64, 0.0]) * 0.5
-                            + 0.5);
-                    frequency *= lacunarity;
-                    amplitude *= gain;
-                }
-
-                for z in 0..height as u32 {
-                    let idx = (z * REGION_SIZE * REGION_SIZE) + (y * REGION_SIZE) + x;
-
-                    data[idx as usize] = 1u32;
-                }
-            }
-        }
-
-        return data;
-    }
-
     fn update(delta_time: f32, perframe_data: &mut PerframeData) {
         const sens: f32 = 0.0002;
 
@@ -107,7 +77,7 @@ impl World {
         dx = adjusted_movement.x;
         dy = adjusted_movement.y;
 
-        const SPEED: f32 = 6.0;
+        const SPEED: f32 = 200.0;
 
         dx *= SPEED * delta_time;
         dy *= SPEED * delta_time;
@@ -119,18 +89,18 @@ impl World {
             z: dz,
             w: 0.0,
         };
-        dbg!(perframe_data.camera.position);
+
         perframe_data.camera.position[3] = 1.0;
 
         perframe_data.camera.transform = perframe_data.camera.rotation.into();
-        perframe_data.camera.transform[3] = Vector4 { 
-            x: REGION_SIZE as f32 / 2.0 
-                + CHUNK_SIZE as f32 * f32::fract(perframe_data.camera.position.x / CHUNK_SIZE as f32 - 0.5), 
-            y: REGION_SIZE as f32 / 2.0 
-                + CHUNK_SIZE as f32 * f32::fract(perframe_data.camera.position.y / CHUNK_SIZE as f32 - 0.5), 
-            z: REGION_SIZE as f32 / 2.0 
-                + CHUNK_SIZE as f32 * f32::fract(perframe_data.camera.position.z / CHUNK_SIZE as f32 - 0.5), 
-            w: 1.0 
+        perframe_data.camera.transform[3] = Vector4 {
+            x: (REGION_SIZE as f32 / 2.0) as u32 as f32
+                + f32::fract(perframe_data.camera.position.x),
+            y: (REGION_SIZE as f32 / 2.0) as u32 as f32
+                + f32::fract(perframe_data.camera.position.y),
+            z: (REGION_SIZE as f32 / 2.0) as u32 as f32
+                + f32::fract(perframe_data.camera.position.z),
+            w: 1.0,
         };
 
         perframe_data.camera.view = perframe_data.camera.transform.invert().unwrap();
@@ -370,7 +340,7 @@ struct Graphics {
     render_pipeline: wgpu::RenderPipeline,
     perframe_pipeline: wgpu::ComputePipeline,
     create_chunk_pipeline: wgpu::ComputePipeline,
-    chunk_buffer: wgpu::Buffer,
+    batch_buffer: wgpu::Buffer,
     global_buffer: wgpu::Buffer,
     modify_indirect_buffer: wgpu::Buffer,
     indirect_buffer: wgpu::Buffer,
@@ -379,6 +349,11 @@ struct Graphics {
     depth_texture: wgpu::Texture,
     depth_texture_view: wgpu::TextureView,
     depth_texture_sampler: wgpu::Sampler,
+    perlin_texture: wgpu::Texture,
+    perlin_texture_view: wgpu::TextureView,
+    noise_pipeline: wgpu::ComputePipeline,
+    noise_group: wgpu::BindGroup,
+    noise_storage_group: wgpu::BindGroup,
 }
 
 impl Graphics {
@@ -460,26 +435,107 @@ impl Graphics {
             size: 1_000_000,
             mapped_at_creation: false,
         });
-        
+
         let modify_indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Modify Indirect Buffer"),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             size: 1_000_000,
             mapped_at_creation: false,
         });
-        
+
         let global_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Global Buffer"),
             usage: wgpu::BufferUsages::STORAGE,
             size: 1_000_000,
             mapped_at_creation: false,
         });
-        
-        let chunk_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Chunk Buffer"),
-            usage: wgpu::BufferUsages::STORAGE,
-            size: 10_000_000,
+
+        let batch_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Batch Buffer"),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            size: 134217728,
             mapped_at_creation: false,
+        });
+
+        let perlin_texture = device.create_texture(&wgpu::TextureDescriptor {
+            // All textures are stored as 3D, we represent our 2D texture
+            // by setting depth to 1.
+            size: wgpu::Extent3d {
+                width: FIELD_SIZE,
+                height: FIELD_SIZE,
+                depth_or_array_layers: FIELD_SIZE,
+            },
+            mip_level_count: 1, // We'll talk about this a little later
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            // Most images are stored using sRGB so we need to reflect that here.
+            format: wgpu::TextureFormat::Rgba32Float,
+            // TEXTURE_BINDING tells wgpu that we want to use this texture in shaders
+            // COPY_DST means that we want to copy data to this texture
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            label: Some("Perlin texture"),
+            view_formats: &[],
+        });
+
+        let perlin_texture_view =
+            perlin_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let noise_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX
+                        | wgpu::ShaderStages::FRAGMENT
+                        | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("bind_group_layout2"),
+        });
+
+        let noise_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &noise_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&perlin_texture_view),
+                },
+            ],
+            label: Some("bind_group"),
+        });
+        
+        let noise_storage_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX
+                        | wgpu::ShaderStages::FRAGMENT
+                        | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba32Float,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("bind_group_layout2"),
+        });
+        
+        let noise_storage_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &noise_storage_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&perlin_texture_view),
+                },
+            ],
+            label: Some("bind_group"),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -528,7 +584,7 @@ impl Graphics {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
                         has_dynamic_offset: false,
-                        min_binding_size: Some(NonZeroU64::new(1_000_000).unwrap()),
+                        min_binding_size: Some(NonZeroU64::new(134217728).unwrap()),
                     },
                     count: None,
                 },
@@ -566,9 +622,9 @@ impl Graphics {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &chunk_buffer,
+                        buffer: &batch_buffer,
                         offset: 0,
-                        size: Some(NonZeroU64::new(1_000_000).unwrap()),
+                        size: Some(NonZeroU64::new(134217728).unwrap()),
                     }),
                 },
             ],
@@ -577,9 +633,16 @@ impl Graphics {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[&bind_group_layout, &noise_group_layout],
             push_constant_ranges: &[],
         });
+        
+        let pipeline_layout2 = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Render Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout, &noise_storage_group_layout],
+            push_constant_ranges: &[],
+        });
+
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
@@ -590,12 +653,20 @@ impl Graphics {
             entry_point: "cs_perframe",
         });
         
-        let create_chunk_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        let noise_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
-            layout: Some(&pipeline_layout),
+            layout: Some(&pipeline_layout2),
             module: &shader,
-            entry_point: "cs_create_chunks",
+            entry_point: "cs_noise",
         });
+
+        let create_chunk_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: "cs_create_chunks",
+            });
 
         let depth_size = wgpu::Extent3d {
             // 2.
@@ -691,11 +762,16 @@ impl Graphics {
             indirect_buffer,
             modify_indirect_buffer,
             global_buffer,
-            chunk_buffer,
+            batch_buffer,
             bind_group,
             depth_texture,
             depth_texture_view,
             depth_texture_sampler,
+            noise_pipeline,
+            noise_group,
+            noise_storage_group,
+            perlin_texture,
+            perlin_texture_view,
         }
     }
 
@@ -767,6 +843,7 @@ impl Graphics {
             });
 
             compute_pass.set_bind_group(0, &self.bind_group, &[]);
+            compute_pass.set_bind_group(1, &self.noise_group, &[]);
 
             compute_pass.set_pipeline(&self.perframe_pipeline);
             compute_pass.dispatch_workgroups(1, 1, 1);
@@ -774,11 +851,23 @@ impl Graphics {
 
         encoder.copy_buffer_to_buffer(
             &self.modify_indirect_buffer,
-            mem::size_of::<wgpu::util::DrawIndirect>() as u64,
+            0,
             &self.indirect_buffer,
-            mem::size_of::<wgpu::util::DrawIndirect>() as u64,
-            mem::size_of::<wgpu::util::DispatchIndirect>() as u64,
+            0,
+            2 * mem::size_of::<wgpu::util::DispatchIndirect>() as u64,
         );
+        
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Compute Pass"),
+            });
+
+            compute_pass.set_bind_group(0, &self.bind_group, &[]);
+            compute_pass.set_bind_group(1, &self.noise_storage_group, &[]);
+
+            compute_pass.set_pipeline(&self.noise_pipeline);
+            compute_pass.dispatch_workgroups_indirect(&self.indirect_buffer, mem::size_of::<wgpu::util::DispatchIndirect>() as u64);
+        }
 
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -786,19 +875,23 @@ impl Graphics {
             });
 
             compute_pass.set_bind_group(0, &self.bind_group, &[]);
+            compute_pass.set_bind_group(1, &self.noise_group, &[]);
 
-            let mut offset = mem::size_of::<wgpu::util::DrawIndirect>() as u64;
             compute_pass.set_pipeline(&self.create_chunk_pipeline);
-            compute_pass.dispatch_workgroups_indirect(&self.indirect_buffer, offset);
+            compute_pass.dispatch_workgroups_indirect(&self.indirect_buffer, 0);
         }
 
-        encoder.copy_buffer_to_buffer(
-            &self.modify_indirect_buffer,
-            0,
-            &self.indirect_buffer,
-            0,
-            mem::size_of::<wgpu::util::DrawIndirect>() as u64,
-        );
+        for i in 0..MAX_BATCHES {
+            encoder.copy_buffer_to_buffer(
+                &self.batch_buffer,
+                4 * mem::size_of::<u32>() as u64
+                    + i as u64
+                        * (4 * mem::size_of::<u32>() + 100_000 * 4 * mem::size_of::<f32>()) as u64,
+                &self.indirect_buffer,
+                (2 * mem::size_of::<wgpu::util::DispatchIndirect>()) as u64 + (i as usize * 4 * mem::size_of::<u32>()) as u64,
+                4 * mem::size_of::<u32>() as u64,
+            );
+        }
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -827,9 +920,16 @@ impl Graphics {
             });
 
             render_pass.set_bind_group(0, &self.bind_group, &[]);
+            render_pass.set_bind_group(1, &self.noise_group, &[]);
 
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.draw_indirect(&self.indirect_buffer, 0);
+
+            for i in 0..MAX_BATCHES {
+                render_pass.draw_indirect(
+                    &self.indirect_buffer,
+                    (2 * mem::size_of::<wgpu::util::DispatchIndirect>()) as u64 + (4 * i as usize * mem::size_of::<u32>()) as u64,
+                );
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

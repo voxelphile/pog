@@ -1159,6 +1159,7 @@ dependencies = [
  "env_logger",
  "log",
  "noise",
+ "serde",
  "tokio",
  "wgpu",
  "winit",
