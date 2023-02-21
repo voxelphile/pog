@@ -121,7 +121,7 @@ impl World {
         dx = adjusted_movement.x;
         dy = adjusted_movement.y;
 
-        const SPEED: f32 = 200.0;
+        const SPEED: f32 = 20.0;
 
         dx *= SPEED * delta_time;
         dy *= SPEED * delta_time;
@@ -138,12 +138,12 @@ impl World {
 
         perframe_data.camera.transform = perframe_data.camera.rotation.into();
         perframe_data.camera.transform[3] = Vector4 {
-            x: (REGION_SIZE as f32 / 2.0) as u32 as f32
-                + f32::fract(perframe_data.camera.position.x),
-            y: (REGION_SIZE as f32 / 2.0) as u32 as f32
-                + f32::fract(perframe_data.camera.position.y),
-            z: (REGION_SIZE as f32 / 2.0) as u32 as f32
-                + f32::fract(perframe_data.camera.position.z),
+            x: (REGION_SIZE as f32 / 2.0)
+                + (f32::fract(perframe_data.camera.position.x)),
+            y: (REGION_SIZE as f32 / 2.0)
+                + (f32::fract(perframe_data.camera.position.y)),
+            z: (REGION_SIZE as f32 / 2.0)
+                + (f32::fract(perframe_data.camera.position.z)),
             w: 1.0,
         };
 
@@ -345,7 +345,10 @@ impl State {
                 ));
 
                 match self.graphics.render(perframe_data) {
-                    Err(wgpu::SurfaceError::Outdated) => self.graphics.resize(),
+                    Err(wgpu::SurfaceError::Outdated)
+                    | Ok(_) if self.graphics.config.width != self.graphics.window_size.width
+                        || self.graphics.config.height != self.graphics.window_size.height
+                        => self.graphics.resize(),
                     Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
                     _ => {}
                 }

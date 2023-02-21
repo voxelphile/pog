@@ -198,15 +198,13 @@ fn perlin(position: vec3<f32>, seed: i32) -> f32 {
 
 	k = mix(jx0, jx1, s.z);
 
-	var value = (k + 1.0) / 2.0;	
-
-	return value;
+	return k;
 }
 
 fn fbm(position: vec3<f32>, seed: i32) -> f32 {
 	var octaves = 10;
 	var lacunarity = 2.0;
-	var gain = 0.3;
+	var gain = 0.5;
 	var amplitude = 1.0;
 	var frequency = 0.05;
 	var height = 0.0;
@@ -222,9 +220,11 @@ fn fbm(position: vec3<f32>, seed: i32) -> f32 {
 
 fn world_gen(position: vec3<i32>) -> u32 {
 	var border = (textureDimensions(perlin_texture).x - region_size) / 2;
-	var pos = position - global_buffer.floating_origin + border; 
-	pos.z = 0;
-	var perlin = textureLoad(perlin_texture, pos, 0).rgb;
+	var pos = vec3<f32>(position) 
+		- vec3<f32>(global_buffer.floating_origin)
+		+ vec3<f32>(f32(border)); 
+	pos.z = 0.0;
+	var perlin = textureLoad(perlin_texture, vec3<i32>(pos), 0).rgb;
 	var csample = sample_buffer.continentalness[u32(f32(perlin.r) * f32(max_samples))];
 	var esample = sample_buffer.erosion[u32(f32(perlin.g) * f32(max_samples))];
 	var pandvsample = sample_buffer.pandv[u32(f32(perlin.b) * f32(max_samples))];
@@ -658,6 +658,20 @@ struct FragmentOutput {
 	@location(0) display: vec4<f32>,
 }
 
+fn map_range(s: f32, a1: f32, a2: f32, b1: f32, b2: f32) -> f32
+{
+    return b1 + (s-a1)*(b2-b1)/(a2-a1);
+}
+
+fn map_range3d(s: vec3<f32>, a1: vec3<f32>, a2: vec3<f32>, b1: vec3<f32>, b2: vec3<f32>) -> vec3<f32>
+{
+	return vec3<f32>(
+		map_range(s.x, a1.x, a2.x, b1.x, b2.x),
+		map_range(s.y, a1.y, a2.y, b1.y, b2.y),
+		map_range(s.z, a1.z, a2.z, b1.z, b2.z),
+	);
+}
+
 @fragment
 fn fs_main(
 	in: VertexOutput,
@@ -670,7 +684,7 @@ fn fs_main(
 	var ray: Ray;
 	ray.origin = origin;
 	ray.offset = offset;
-	ray.direction = normalize(ray.origin - vec3<f32>(floor(f32(region_size) / 2.0) + fract(ray.offset)));
+	ray.direction = normalize(ray.origin - perframe_buffer.camera.transform[3].xyz);
 	ray.max_distance = 1000.0;
 	// TODO see if I can eliminate the fluff?
 	ray.minimum = vec3<i32>(in.chunk_position.xyz) - 1;
@@ -693,13 +707,23 @@ fn fs_main(
 	var color = vec3(1.0);
 
 	var border = (textureDimensions(perlin_texture).x - region_size) / 2;
-	var pos = ray_hit.destination - vec3<f32>(global_buffer.floating_origin + border); 
-	var noise_factor =
-		textureLoad(perlin_texture, vec3<i32>(pos), 0).r;
-
+	var pos = ray_hit.destination 
+		+ floor(perframe_buffer.camera.position.xyz)
+		- vec3<f32>(global_buffer.floating_origin)
+		+ vec3<f32>(f32(border)); 
+	var noise_factor = saturate(
+		map_range(
+			textureLoad(perlin_texture, vec3<i32>(pos), 0).r, 
+			-sqrt(3.0) / 2.0, 
+			sqrt(3.0) / 2.0, 
+			-1.5, 
+			2.5
+		)
+	);
 
 	if(ray_hit.block_id == u32(BLOCK_ID_GRASS)) {
-		color *= mix(vec3<f32>(170.0, 255.0, 21.0) / 256.0, vec3<f32>(34.0, 139.0, 34.0) / 256.0, noise_factor);
+		color *= mix(vec3<f32>(84.0, 127.0, 68.0) / 256.0, vec3<f32>(34.0, 139.0, 34.0) / 256.0, noise_factor);
+
 	}
 	if(ray_hit.block_id == u32(BLOCK_ID_STONE)) {
 		color *= mix(vec3<f32>(135.0) / 256.0, vec3<f32>(20.0) / 256.0, noise_factor);
