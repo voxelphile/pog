@@ -405,7 +405,8 @@ struct Graphics {
     config: wgpu::SurfaceConfiguration,
     window_size: winit::dpi::PhysicalSize<u32>,
     window: Window,
-    render_pipeline: wgpu::RenderPipeline,
+    front_render_pipeline: wgpu::RenderPipeline,
+    back_render_pipeline: wgpu::RenderPipeline,
     perframe_pipeline: wgpu::ComputePipeline,
     create_chunk_pipeline: wgpu::ComputePipeline,
     batch_buffer: wgpu::Buffer,
@@ -813,7 +814,7 @@ impl Graphics {
             ..Default::default()
         });
 
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let front_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
@@ -858,6 +859,52 @@ impl Graphics {
             },
             multiview: None, // 5.
         });
+        
+        let back_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main", // 1.
+                buffers: &[],           // 2.
+            },
+            fragment: Some(wgpu::FragmentState {
+                // 3.
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    // 4.
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList, // 1.
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw, // 2.
+                cull_mode: Some(wgpu::Face::Front),
+                // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
+                polygon_mode: wgpu::PolygonMode::Fill,
+                // Requires Features::DEPTH_CLIP_CONTROL
+                unclipped_depth: false,
+                // Requires Features::CONSERVATIVE_RASTERIZATION
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Always, // 1.
+                stencil: wgpu::StencilState::default(),     // 2.
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,                         // 2.
+                mask: !0,                         // 3.
+                alpha_to_coverage_enabled: false, // 4.
+            },
+            multiview: None, // 5.
+        });
 
         let egui_renderer = egui_wgpu::Renderer::new(
             &device,
@@ -883,7 +930,8 @@ impl Graphics {
             queue,
             config,
             window_size,
-            render_pipeline,
+            front_render_pipeline,
+            back_render_pipeline,
             perframe_pipeline,
             create_chunk_pipeline,
             perframe_buffer,
@@ -1034,7 +1082,7 @@ impl Graphics {
             compute_pass.dispatch_workgroups_indirect(&self.indirect_buffer, 0);
         }
 
-        for i in 0..MAX_BATCHES {
+        for i in 0..=MAX_BATCHES {
             encoder.copy_buffer_to_buffer(
                 &self.batch_buffer,
                 4 * mem::size_of::<u32>() as u64
@@ -1106,15 +1154,23 @@ impl Graphics {
             render_pass.set_bind_group(0, &self.bind_group, &[]);
             render_pass.set_bind_group(1, &self.noise_group, &[]);
 
-            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_pipeline(&self.front_render_pipeline);
 
             for i in 0..MAX_BATCHES {
                 render_pass.draw_indirect(
                     &self.indirect_buffer,
                     (2 * mem::size_of::<wgpu::util::DispatchIndirect>()) as u64
-                        + (4 * i as usize * mem::size_of::<u32>()) as u64,
+                        + (i as usize * mem::size_of::<wgpu::util::DrawIndirect>()) as u64,
                 );
             }
+            
+            render_pass.set_pipeline(&self.back_render_pipeline);
+                
+            render_pass.draw_indirect(
+                    &self.indirect_buffer,
+                    (2 * mem::size_of::<wgpu::util::DispatchIndirect>()) as u64
+                        + (MAX_BATCHES as usize * mem::size_of::<wgpu::util::DrawIndirect>()) as u64,
+            );
 
             //Draw the ui after the world
             self.egui

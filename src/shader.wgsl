@@ -255,7 +255,7 @@ fn cs_perframe() {
 		indirect_buffer.create_chunk_z = u32(size.z / chunk_size);
 
 		batch_buffer.batch_count = u32(0);
-		for(var i = 0; i < max_batches; i++) {
+		for(var i = 0; i <= max_batches; i++) {
 			batch_buffer.batches[i].batch_vertex_count = u32(36);
 			batch_buffer.batches[i].batch_instance_count = u32(0);
 			batch_buffer.batches[i].batch_base_instance = u32(i * 100000);
@@ -371,10 +371,36 @@ fn cs_create_chunks(
 	if(lid == u32(0) && solid_blocks != 0) {
 		var batch_count: u32;
 		var instance: u32;
+	
+		{
+			var pos = perframe_buffer.camera.transform[3].xyz;
+			var min = vec3<f32>(voxel_pos) - 1.0;
+			var max = vec3<f32>(voxel_pos) + 1.0 + f32(chunk_size);
 
+			var near_chunk = pos.x >= min.x
+				&& pos.y >= min.y
+				&& pos.z >= min.z
+				&& pos.x < max.x
+				&& pos.y < max.y
+				&& pos.z < max.z;
+
+			if(near_chunk) {
+				//put this chunk in two batches
+				//the last batch draws back faces,
+				//which we draw in addition to the front faces
+				var instance = atomicAdd(&batch_buffer.batches[max_batches].batch_instance_count, u32(1));
+				batch_buffer.batches[max_batches].batch_chunks[instance].position = vec4(voxel_pos / chunk_size, 1); 
+				
+			}
+		}
+
+		
 		loop {
 			batch_count = atomicLoad(&batch_buffer.batch_count);
 			instance = atomicLoad(&batch_buffer.batches[batch_count].batch_instance_count);
+			if(batch_count >= u32(max_batches)) {
+				return;
+			}
 
 			if(instance >= u32(100000)) {
 				if(atomicCompareExchangeWeak(&batch_buffer.batch_count, batch_count, batch_count + u32(1)).exchanged) {
@@ -388,6 +414,7 @@ fn cs_create_chunks(
 			}
 		}
 		
+				
 		batch_buffer.batches[batch_count].batch_chunks[instance].position = vec4(voxel_pos / chunk_size, 1); 
 	}
 }
@@ -655,6 +682,7 @@ fn voxel_ao(position: vec3<i32>, d1: vec3<i32>, d2: vec3<i32>) -> vec4<f32> {
 }
 
 struct FragmentOutput {
+	@builtin(frag_depth) depth: f32,
 	@location(0) display: vec4<f32>,
 }
 
@@ -675,16 +703,26 @@ fn map_range3d(s: vec3<f32>, a1: vec3<f32>, a2: vec3<f32>, b1: vec3<f32>, b2: ve
 @fragment
 fn fs_main(
 	in: VertexOutput,
+	@builtin(front_facing) front: bool,
 ) -> FragmentOutput {
 	var output: FragmentOutput;
 
-	var origin = in.chunk_position.xyz + in.local_position.xyz + 1e-2 * vec3<f32>(in.chunk_normal.xyz);
-	var offset = perframe_buffer.camera.position.xyz;
+	var v_position = in.chunk_position.xyz 
+			+ in.local_position.xyz
+			+ 1e-3 * vec3<f32>(in.chunk_normal.xyz);
+	var o_position = perframe_buffer.camera.transform[3].xyz;
+
+	var origin: vec3<f32>;
+	
+	if(front) {
+		origin = v_position;
+	} else {
+		origin = o_position;
+	}
 
 	var ray: Ray;
 	ray.origin = origin;
-	ray.offset = offset;
-	ray.direction = normalize(ray.origin - perframe_buffer.camera.transform[3].xyz);
+	ray.direction = normalize(v_position - o_position);
 	ray.max_distance = 1000.0;
 	// TODO see if I can eliminate the fluff?
 	ray.minimum = vec3<i32>(in.chunk_position.xyz) - 1;
@@ -745,6 +783,12 @@ fn fs_main(
 	var result = vec4(color, 1.0);
 
 	output.display = result;
+
+	var v_clip_coord = perframe_buffer.camera.projection 
+		* perframe_buffer.camera.view 
+		* vec4(ray_hit.destination, 1.0);
+	var f_ndc_depth = v_clip_coord.z / v_clip_coord.w;
+	output.depth = (f_ndc_depth + 1.0) * 0.4;
 
 	return output;
 }
