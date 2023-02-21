@@ -658,20 +658,6 @@ struct FragmentOutput {
 	@location(0) display: vec4<f32>,
 }
 
-fn map_range(s: f32, a1: f32, a2: f32, b1: f32, b2: f32) -> f32
-{
-    return b1 + (s-a1)*(b2-b1)/(a2-a1);
-}
-
-fn map_range3d(s: vec3<f32>, a1: vec3<f32>, a2: vec3<f32>, b1: vec3<f32>, b2: vec3<f32>) -> vec3<f32>
-{
-	return vec3<f32>(
-		map_range(s.x, a1.x, a2.x, b1.x, b2.x),
-		map_range(s.y, a1.y, a2.y, b1.y, b2.y),
-		map_range(s.z, a1.z, a2.z, b1.z, b2.z),
-	);
-}
-
 @fragment
 fn fs_main(
 	in: VertexOutput,
@@ -708,13 +694,8 @@ fn fs_main(
 
 	var border = (textureDimensions(perlin_texture).x - region_size) / 2;
 	var pos = ray_hit.destination - vec3<f32>(global_buffer.floating_origin + border); 
-	var noise_factor = map_range3d(
-		textureLoad(perlin_texture, vec3<i32>(pos), 0).rgb,
-		vec3<f32>(0.5),
-		vec3<f32>(0.8),
-		vec3<f32>(0.0),
-		vec3<f32>(1.0)
-	).r;
+	var noise_factor =
+		textureLoad(perlin_texture, vec3<i32>(pos), 0).r;
 
 
 	if(ray_hit.block_id == u32(BLOCK_ID_GRASS)) {
