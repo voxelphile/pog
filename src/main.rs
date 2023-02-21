@@ -3,7 +3,7 @@ use cgmath::{
     Deg, Euler, InnerSpace, Matrix4, PerspectiveFov, Quaternion, Rad, Rotation3, SquareMatrix,
     Vector2, Vector3, Vector4,
 };
-use noise::{NoiseFn, Simplex, Seedable};
+use noise::{NoiseFn, Seedable, Simplex};
 use std::{
     future::Future,
     mem,
@@ -20,10 +20,12 @@ use winit::{
     window::Window,
     window::WindowBuilder,
 };
+use splines::{Interpolation, Key, Spline};
 
 pub const REGION_SIZE: u32 = 128;
 pub const FIELD_SIZE: u32 = 256;
 pub const CHUNK_SIZE: u32 = 4;
+pub const SAMPLE_COUNT: u32 = 1000;
 pub const MAX_BATCHES: u32 = 10;
 
 #[rustfmt::skip]
@@ -48,6 +50,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct World;
 
 impl World {
+    fn continentalness() -> splines::Spline<f32, f32> {
+        Spline::from_vec(vec![
+            Key::new(0.0, 1.0, Interpolation::Cosine),
+            Key::new(1.0 / 11.0, 0.1, Interpolation::Cosine),
+            Key::new(3.5 / 11.0, 0.1, Interpolation::Cosine),
+            Key::new(4.0 / 11.0, 0.4, Interpolation::Cosine),
+            Key::new(5.1 / 11.0, 0.4, Interpolation::Cosine),
+            Key::new(5.2 / 11.0, 0.8, Interpolation::Cosine),
+            Key::new(5.5 / 11.0, 0.8, Interpolation::Cosine),
+            Key::new(7.0 / 11.0, 0.9, Interpolation::Cosine),
+            Key::new(1.0, 1.0, Interpolation::default()),
+        ])
+    }
+    
+    fn erosion() -> splines::Spline<f32, f32> {
+        Spline::from_vec(vec![
+            Key::new(0.0, 1.0, Interpolation::Cosine),
+            Key::new(1.5 / 9.0, 5.5 / 8.0, Interpolation::Cosine),
+            Key::new(3.0 / 9.0, 4.0 / 8.0, Interpolation::Cosine),
+            Key::new(3.3 / 9.0, 4.5 / 8.0, Interpolation::Cosine),
+            Key::new(4.5 / 9.0, 1.2 / 8.0, Interpolation::Cosine),
+            Key::new(6.0 / 9.0, 1.0 / 8.0, Interpolation::Cosine),
+            Key::new(7.0 / 9.0, 1.0 / 8.0, Interpolation::Cosine),
+            Key::new(7.2 / 9.0, 3.0 / 8.0, Interpolation::Cosine),
+            Key::new(7.8 / 9.0, 3.0 / 8.0, Interpolation::Cosine),
+            Key::new(8.0 / 9.0, 1.0 / 8.0, Interpolation::Cosine),
+            Key::new(1.0, 0.5, Interpolation::default()),
+        ])
+    }
+    
+    fn pandv() -> splines::Spline<f32, f32> {
+        Spline::from_vec(vec![
+            Key::new(0.0, 0.0, Interpolation::Cosine),
+            Key::new(1.0 / 5.0, 1.0 / 7.0, Interpolation::Cosine),
+            Key::new(2.2 / 5.0, 2.0 / 7.0, Interpolation::Cosine),
+            Key::new(3.0 / 5.0, 2.0 / 7.0, Interpolation::Cosine),
+            Key::new(3.8 / 5.0, 5.5 / 7.0, Interpolation::Cosine),
+            Key::new(4.2 / 5.0, 6.5 / 7.0, Interpolation::Cosine),
+            Key::new(1.0, 0.8, Interpolation::default()),
+        ])
+    }
+
     fn update(delta_time: f32, perframe_data: &mut PerframeData) {
         const sens: f32 = 0.0002;
 
@@ -168,112 +212,127 @@ impl State {
             Event::WindowEvent {
                 ref event,
                 window_id,
-            } if window_id == self.graphics.window.id() => match event {
-                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-                WindowEvent::Resized(physical_size) => {
-                    self.graphics.window_size = *physical_size;
-                    perframe_data.camera.resolution = Vector2 {
-                        x: physical_size.width as f32,
-                        y: physical_size.height as f32,
-                    };
+            } if window_id == self.graphics.window.id() => {
+                let egui_response = self
+                    .graphics
+                    .egui
+                    .state
+                    .on_event(&self.graphics.egui.context, event);
+
+                if (egui_response.consumed) {
+                    return;
                 }
-                WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                    self.graphics.window_size = **new_inner_size;
-                    perframe_data.camera.resolution = Vector2 {
-                        x: new_inner_size.width as f32,
-                        y: new_inner_size.height as f32,
-                    };
-                }
-                WindowEvent::CursorMoved { position, .. } => {
-                    if cursor_captured {
-                        let winit::dpi::PhysicalPosition { x, y } = position;
 
-                        let winit::dpi::PhysicalSize { width, height } =
-                            self.graphics.window.inner_size();
-
-                        let x_diff = x - width as f64 / 2.0;
-                        let y_diff = y - height as f64 / 2.0;
-
-                        self.graphics.window.set_cursor_position(
-                            winit::dpi::PhysicalPosition::new(width as i32 / 2, height as i32 / 2),
-                        );
-
-                        const SENS: f32 = 0.0002;
-
-                        perframe_data.rot_x -= SENS * y_diff as f32;
-                        perframe_data.rot_x =
-                            f32::clamp(perframe_data.rot_x, 0.0, 2.0 * std::f32::consts::PI);
-                        perframe_data.rot_z -= SENS * x_diff as f32;
+                match event {
+                    WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                    WindowEvent::Resized(physical_size) => {
+                        self.graphics.window_size = *physical_size;
+                        perframe_data.camera.resolution = Vector2 {
+                            x: physical_size.width as f32,
+                            y: physical_size.height as f32,
+                        };
                     }
-                }
-                WindowEvent::MouseInput { button, .. } => {
-                    use winit::event::MouseButton::*;
-
-                    match button {
-                        Left => {
-                            cursor_captured = true;
-                            self.graphics
-                                .window
-                                .set_cursor_icon(winit::window::CursorIcon::Crosshair);
-                            self.graphics
-                                .window
-                                .set_cursor_grab(winit::window::CursorGrabMode::Confined)
-                                .expect("could not grab mouse cursor");
-                            perframe_data.action1 = true as _;
-                        }
-                        Right => {
-                            perframe_data.action2 = true as _;
-                        }
-                        _ => {}
+                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                        self.graphics.window_size = **new_inner_size;
+                        perframe_data.camera.resolution = Vector2 {
+                            x: new_inner_size.width as f32,
+                            y: new_inner_size.height as f32,
+                        };
                     }
-                }
-                WindowEvent::KeyboardInput { input, .. } => {
-                    let Some(key_code) = input.virtual_keycode else {
+                    WindowEvent::CursorMoved { position, .. } => {
+                        if cursor_captured {
+                            let winit::dpi::PhysicalPosition { x, y } = position;
+
+                            let winit::dpi::PhysicalSize { width, height } =
+                                self.graphics.window.inner_size();
+
+                            let x_diff = x - width as f64 / 2.0;
+                            let y_diff = y - height as f64 / 2.0;
+
+                            self.graphics.window.set_cursor_position(
+                                winit::dpi::PhysicalPosition::new(
+                                    width as i32 / 2,
+                                    height as i32 / 2,
+                                ),
+                            );
+
+                            const SENS: f32 = 0.0002;
+
+                            perframe_data.rot_x -= SENS * y_diff as f32;
+                            perframe_data.rot_x =
+                                f32::clamp(perframe_data.rot_x, 0.0, 2.0 * std::f32::consts::PI);
+                            perframe_data.rot_z -= SENS * x_diff as f32;
+                        }
+                    }
+                    WindowEvent::MouseInput { button, .. } => {
+                        use winit::event::MouseButton::*;
+
+                        match button {
+                            Left => {
+                                cursor_captured = true;
+                                self.graphics
+                                    .window
+                                    .set_cursor_icon(winit::window::CursorIcon::Crosshair);
+                                self.graphics
+                                    .window
+                                    .set_cursor_grab(winit::window::CursorGrabMode::Confined)
+                                    .expect("could not grab mouse cursor");
+                                perframe_data.action1 = true as _;
+                            }
+                            Right => {
+                                perframe_data.action2 = true as _;
+                            }
+                            _ => {}
+                        }
+                    }
+                    WindowEvent::KeyboardInput { input, .. } => {
+                        let Some(key_code) = input.virtual_keycode else {
                     return;
                 };
 
-                    use winit::event::VirtualKeyCode::*;
+                        use winit::event::VirtualKeyCode::*;
 
-                    match key_code {
-                        W => {
-                            perframe_data.forward =
-                                (input.state == winit::event::ElementState::Pressed) as _
-                        }
-                        A => {
-                            perframe_data.left =
-                                (input.state == winit::event::ElementState::Pressed) as _
-                        }
-                        S => {
-                            perframe_data.backward =
-                                (input.state == winit::event::ElementState::Pressed) as _
-                        }
-                        D => {
-                            perframe_data.right =
-                                (input.state == winit::event::ElementState::Pressed) as _
-                        }
-                        Space => {
-                            perframe_data.up =
-                                (input.state == winit::event::ElementState::Pressed) as _
-                        }
-                        LShift => {
-                            perframe_data.down =
-                                (input.state == winit::event::ElementState::Pressed) as _
-                        }
-                        Escape => {
-                            cursor_captured = false;
-                            self.graphics
-                                .window
-                                .set_cursor_icon(winit::window::CursorIcon::Default);
-                            self.graphics
-                                .window
-                                .set_cursor_grab(winit::window::CursorGrabMode::None)
-                                .expect("could not grab mouse cursor");
-                        }
-                        _ => {}
-                    };
+                        match key_code {
+                            W => {
+                                perframe_data.forward =
+                                    (input.state == winit::event::ElementState::Pressed) as _
+                            }
+                            A => {
+                                perframe_data.left =
+                                    (input.state == winit::event::ElementState::Pressed) as _
+                            }
+                            S => {
+                                perframe_data.backward =
+                                    (input.state == winit::event::ElementState::Pressed) as _
+                            }
+                            D => {
+                                perframe_data.right =
+                                    (input.state == winit::event::ElementState::Pressed) as _
+                            }
+                            Space => {
+                                perframe_data.up =
+                                    (input.state == winit::event::ElementState::Pressed) as _
+                            }
+                            LShift => {
+                                perframe_data.down =
+                                    (input.state == winit::event::ElementState::Pressed) as _
+                            }
+                            Escape => {
+                                cursor_captured = false;
+                                self.graphics
+                                    .window
+                                    .set_cursor_icon(winit::window::CursorIcon::Default);
+                                self.graphics
+                                    .window
+                                    .set_cursor_grab(winit::window::CursorGrabMode::None)
+                                    .expect("could not grab mouse cursor");
+                            }
+                            _ => {}
+                        };
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             Event::RedrawRequested(window_id) if window_id == self.graphics.window.id() => {
                 let current_instant = time::Instant::now();
                 let delta_time = current_instant.duration_since(last_instant).as_secs_f32();
@@ -330,6 +389,12 @@ struct PerframeData {
 unsafe impl bytemuck::Zeroable for PerframeData {}
 unsafe impl bytemuck::Pod for PerframeData {}
 
+struct Egui {
+    state: egui_winit::State,
+    renderer: egui_wgpu::Renderer,
+    context: egui::Context,
+}
+
 struct Graphics {
     surface: wgpu::Surface,
     device: wgpu::Device,
@@ -354,6 +419,7 @@ struct Graphics {
     noise_pipeline: wgpu::ComputePipeline,
     noise_group: wgpu::BindGroup,
     noise_storage_group: wgpu::BindGroup,
+    egui: Egui,
 }
 
 impl Graphics {
@@ -457,6 +523,35 @@ impl Graphics {
             mapped_at_creation: false,
         });
 
+        let mut samples = vec![];
+        let continentalness = World::continentalness();
+        let erosion = World::erosion();
+        let pandv = World::pandv();
+
+        for i in 0..SAMPLE_COUNT { 
+            let x = i as f64 * (1.0 / SAMPLE_COUNT as f64);
+            let y = continentalness.sample(x as f32).unwrap() as f32;
+            samples.push(y);
+        }
+        
+        for i in 0..SAMPLE_COUNT { 
+            let x = i as f64 * (1.0 / SAMPLE_COUNT as f64);
+            let y = erosion.sample(x as f32).unwrap() as f32;
+            samples.push(y);
+        }
+        
+        for i in 0..SAMPLE_COUNT { 
+            let x = i as f64 * (1.0 / SAMPLE_COUNT as f64);
+            let y = pandv.sample(x as f32).unwrap() as f32;
+            samples.push(y);
+        }
+
+        let sample_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Sample buffer"),
+            usage: wgpu::BufferUsages::STORAGE,
+            contents: bytemuck::cast_slice(&samples),
+        });
+
         let perlin_texture = device.create_texture(&wgpu::TextureDescriptor {
             // All textures are stored as 3D, we represent our 2D texture
             // by setting depth to 1.
@@ -480,9 +575,9 @@ impl Graphics {
         let perlin_texture_view =
             perlin_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let noise_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
+        let noise_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::VERTEX
                         | wgpu::ShaderStages::FRAGMENT
@@ -493,25 +588,22 @@ impl Graphics {
                         multisampled: false,
                     },
                     count: None,
-                },
-            ],
-            label: Some("bind_group_layout2"),
-        });
+                }],
+                label: Some("bind_group_layout2"),
+            });
 
         let noise_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &noise_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&perlin_texture_view),
-                },
-            ],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&perlin_texture_view),
+            }],
             label: Some("bind_group"),
         });
-        
-        let noise_storage_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
+
+        let noise_storage_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::VERTEX
                         | wgpu::ShaderStages::FRAGMENT
@@ -522,19 +614,16 @@ impl Graphics {
                         view_dimension: wgpu::TextureViewDimension::D3,
                     },
                     count: None,
-                },
-            ],
-            label: Some("bind_group_layout2"),
-        });
-        
+                }],
+                label: Some("bind_group_layout2"),
+            });
+
         let noise_storage_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &noise_storage_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&perlin_texture_view),
-                },
-            ],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&perlin_texture_view),
+            }],
             label: Some("bind_group"),
         });
 
@@ -588,6 +677,18 @@ impl Graphics {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::VERTEX
+                        | wgpu::ShaderStages::FRAGMENT
+                        | wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: Some(NonZeroU64::new(1000 * 12).unwrap()),
+                    },
+                    count: None,
+                },
             ],
             label: Some("bind_group_layout"),
         });
@@ -627,6 +728,14 @@ impl Graphics {
                         size: Some(NonZeroU64::new(134217728).unwrap()),
                     }),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &sample_buffer,
+                        offset: 0,
+                        size: Some(NonZeroU64::new(1000 * 12).unwrap()),
+                    }),
+                },
             ],
             label: Some("bind_group"),
         });
@@ -636,13 +745,12 @@ impl Graphics {
             bind_group_layouts: &[&bind_group_layout, &noise_group_layout],
             push_constant_ranges: &[],
         });
-        
+
         let pipeline_layout2 = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
             bind_group_layouts: &[&bind_group_layout, &noise_storage_group_layout],
             push_constant_ranges: &[],
         });
-
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
@@ -652,7 +760,7 @@ impl Graphics {
             module: &shader,
             entry_point: "cs_perframe",
         });
-        
+
         let noise_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
             layout: Some(&pipeline_layout2),
@@ -748,6 +856,23 @@ impl Graphics {
             multiview: None, // 5.
         });
 
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            surface_format,
+            Some(wgpu::TextureFormat::Depth32Float),
+            1,
+        );
+
+        let egui_state = egui_winit::State::new(&event_loop);
+
+        let egui_context = egui::Context::default();
+
+        let egui = Egui {
+            renderer: egui_renderer,
+            state: egui_state,
+            context: egui_context,
+        };
+
         Self {
             window,
             surface,
@@ -772,6 +897,7 @@ impl Graphics {
             noise_storage_group,
             perlin_texture,
             perlin_texture_view,
+            egui,
         }
     }
 
@@ -818,6 +944,27 @@ impl Graphics {
         }
     }
 
+    fn ui(ctx: &egui::Context) {
+        egui::Window::new("My Window")
+            .default_open(true)
+            .show(ctx, |ui| {
+                use egui::plot::{Line, Plot, PlotPoints};
+                let resolution = 1000;
+                let spline = World::pandv();
+                let sin: PlotPoints = (0..resolution)
+                    .map(|i| {
+                        let x = i as f64 * (1.0 / resolution as f64);
+                        let y = spline.sample(x as f32).unwrap();
+                        [x, y as f64]
+                    })
+                    .collect();
+                let line = Line::new(sin);
+                Plot::new("my_plot")
+                    .view_aspect(2.0)
+                    .show(ui, |plot_ui| plot_ui.line(line));
+            });
+    }
+
     fn render(&mut self, perframe_data: PerframeData) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
 
@@ -856,7 +1003,7 @@ impl Graphics {
             0,
             2 * mem::size_of::<wgpu::util::DispatchIndirect>() as u64,
         );
-        
+
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Compute Pass"),
@@ -866,7 +1013,10 @@ impl Graphics {
             compute_pass.set_bind_group(1, &self.noise_storage_group, &[]);
 
             compute_pass.set_pipeline(&self.noise_pipeline);
-            compute_pass.dispatch_workgroups_indirect(&self.indirect_buffer, mem::size_of::<wgpu::util::DispatchIndirect>() as u64);
+            compute_pass.dispatch_workgroups_indirect(
+                &self.indirect_buffer,
+                mem::size_of::<wgpu::util::DispatchIndirect>() as u64,
+            );
         }
 
         {
@@ -888,10 +1038,41 @@ impl Graphics {
                     + i as u64
                         * (4 * mem::size_of::<u32>() + 100_000 * 4 * mem::size_of::<f32>()) as u64,
                 &self.indirect_buffer,
-                (2 * mem::size_of::<wgpu::util::DispatchIndirect>()) as u64 + (i as usize * 4 * mem::size_of::<u32>()) as u64,
+                (2 * mem::size_of::<wgpu::util::DispatchIndirect>()) as u64
+                    + (i as usize * 4 * mem::size_of::<u32>()) as u64,
                 4 * mem::size_of::<u32>() as u64,
             );
         }
+
+        //Draw the ui. Note this is not where the ui is rendered.
+        //the ui is rendered after the world
+        self.egui.context.request_repaint();
+
+        let full_output = self
+            .egui
+            .context
+            .run(self.egui.state.take_egui_input(&self.window), Self::ui);
+
+        let clipped_primitives = self.egui.context.tessellate(full_output.shapes);
+
+        let screen_descriptor = egui_wgpu::renderer::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: 1.0,
+        };
+
+        for (id, delta) in full_output.textures_delta.set {
+            self.egui
+                .renderer
+                .update_texture(&self.device, &self.queue, id, &delta);
+        }
+
+        self.egui.renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &clipped_primitives,
+            &screen_descriptor,
+        );
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -901,9 +1082,9 @@ impl Graphics {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 1.0,
-                            g: 0.0,
-                            b: 1.0,
+                            r: 0.1,
+                            g: 0.2,
+                            b: 0.8,
                             a: 1.0,
                         }),
                         store: true,
@@ -927,9 +1108,15 @@ impl Graphics {
             for i in 0..MAX_BATCHES {
                 render_pass.draw_indirect(
                     &self.indirect_buffer,
-                    (2 * mem::size_of::<wgpu::util::DispatchIndirect>()) as u64 + (4 * i as usize * mem::size_of::<u32>()) as u64,
+                    (2 * mem::size_of::<wgpu::util::DispatchIndirect>()) as u64
+                        + (4 * i as usize * mem::size_of::<u32>()) as u64,
                 );
             }
+
+            //Draw the ui after the world
+            self.egui
+                .renderer
+                .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

@@ -1,6 +1,12 @@
 const chunk_size = 4;
 const region_size = 128;
 const max_batches = 10;
+const max_samples = 1000;
+
+const BLOCK_ID_AIR = 1;
+const BLOCK_ID_GRASS = 2;
+const BLOCK_ID_DIRT = 3;
+const BLOCK_ID_STONE = 4;
 
 struct Camera {
 	transform: mat4x4<f32>,
@@ -65,6 +71,14 @@ struct BatchData {
 };
 
 @group(0) @binding(3) var<storage, read_write> batch_buffer : BatchData;
+
+struct SampleData {
+	continentalness: array<f32, 1000>,
+	erosion: array<f32, 1000>,
+	pandv: array<f32, 1000>,
+};
+
+@group(0) @binding(4) var<storage> sample_buffer : SampleData;
 
 @group(1) @binding(0) var perlin_texture: texture_3d<f32>;
 @group(1) @binding(0) var perlin_storage: texture_storage_3d<rgba32float, write>;
@@ -190,9 +204,9 @@ fn perlin(position: vec3<f32>, seed: i32) -> f32 {
 }
 
 fn fbm(position: vec3<f32>, seed: i32) -> f32 {
-	var octaves = 8;
+	var octaves = 10;
 	var lacunarity = 2.0;
-	var gain = 0.5;
+	var gain = 0.3;
 	var amplitude = 1.0;
 	var frequency = 0.05;
 	var height = 0.0;
@@ -209,13 +223,25 @@ fn fbm(position: vec3<f32>, seed: i32) -> f32 {
 fn world_gen(position: vec3<i32>) -> u32 {
 	var border = (textureDimensions(perlin_texture).x - region_size) / 2;
 	var pos = position - global_buffer.floating_origin + border; 
-	var height = 80.0 * textureLoad(perlin_texture, pos, 0).r;
+	pos.z = 0;
+	var perlin = textureLoad(perlin_texture, pos, 0).rgb;
+	var csample = sample_buffer.continentalness[u32(f32(perlin.r) * f32(max_samples))];
+	var esample = sample_buffer.erosion[u32(f32(perlin.g) * f32(max_samples))];
+	var pandvsample = sample_buffer.pandv[u32(f32(perlin.b) * f32(max_samples))];
+	var base_height = 60.0;
+	var c_height = mix(base_height / 2.0, base_height * 2.0, csample);
+	var e_height = mix(c_height, base_height, esample);
+	var height = mix(mix(base_height / 4.0, base_height * 4.0, pandvsample), base_height, 1.0 - esample);
 
-	if(position.z < i32(height)) {
-		return u32(1);
+	if(position.z == i32(height)) {
+		return u32(BLOCK_ID_GRASS);
+	} else if(position.z < i32(height) && position.z > i32(height - 10.0)) {
+		return u32(BLOCK_ID_DIRT);
+	} else if(position.z < i32(height)) {
+		return u32(BLOCK_ID_STONE);
 	}
 
-	return u32(0);
+	return u32(BLOCK_ID_AIR);
 }
 
 @compute
@@ -296,37 +322,37 @@ fn cs_create_chunks(
 		+ vec3<i32>(perframe_buffer.camera.position.xyz)
 	);
 
-	if(block_id != u32(0)) {
+	if(block_id != u32(BLOCK_ID_AIR)) {
 		var up_block = world_gen(
 			voxel_pos
 			+ vec3<i32>(perframe_buffer.camera.position.xyz)
 			+ vec3<i32>(0, 0, 1)
-		) == u32(0);
+		) == u32(BLOCK_ID_AIR);
 		var down_block = world_gen(
 			voxel_pos
 			+ vec3<i32>(perframe_buffer.camera.position.xyz)
 			+ vec3<i32>(0, 0, -1)
-		) == u32(0);
+		) == u32(BLOCK_ID_AIR);
 		var left_block = world_gen(
 			voxel_pos
 			+ vec3<i32>(perframe_buffer.camera.position.xyz)
 			+ vec3<i32>(0, -1, 0)
-		) == u32(0);
+		) == u32(BLOCK_ID_AIR);
 		var right_block = world_gen(
 			voxel_pos
 			+ vec3<i32>(perframe_buffer.camera.position.xyz)
 			+ vec3<i32>(0, 1, 0)
-		) == u32(0);
+		) == u32(BLOCK_ID_AIR);
 		var forward_block = world_gen(
 			voxel_pos
 			+ vec3<i32>(perframe_buffer.camera.position.xyz)
 			+ vec3<i32>(1, 0, 0)
-		) == u32(0);
+		) == u32(BLOCK_ID_AIR);
 		var backward_block = world_gen(
 			voxel_pos
 			+ vec3<i32>(perframe_buffer.camera.position.xyz)
 			+ vec3<i32>(-1, 0, 0)
-		) == u32(0);
+		) == u32(BLOCK_ID_AIR);
 		
 		var exposed = up_block 
 			|| down_block 
@@ -546,7 +572,7 @@ fn ray_cast_check_success(state: ptr<function, RayState>) -> bool {
 		+ vec3<i32>(perframe_buffer.camera.position.xyz)
 	);
 
-	if(block_id != u32(0)) {
+	if(block_id != u32(BLOCK_ID_AIR)) {
 		(*state).id = RAY_STATE_VOXEL_FOUND;
 		(*state).block_id = block_id;
 		return true;
@@ -589,7 +615,7 @@ fn vertex_ao(side: vec2<f32>, corner: f32) -> f32 {
 fn voxel_query(position: vec3<i32>) -> bool {
 	var block_id = world_gen(position);
 
-	if(block_id != u32(0)) {
+	if(block_id != u32(BLOCK_ID_AIR)) {
 		return true;
 	}
 
@@ -628,14 +654,37 @@ fn voxel_ao(position: vec3<i32>, d1: vec3<i32>, d2: vec3<i32>) -> vec4<f32> {
 	return 1.0 - ret;
 }
 
+struct FragmentOutput {
+	@location(0) display: vec4<f32>,
+}
+
+fn map_range(s: f32, a1: f32, a2: f32, b1: f32, b2: f32) -> f32
+{
+    return b1 + (s-a1)*(b2-b1)/(a2-a1);
+}
+
+fn map_range3d(s: vec3<f32>, a1: vec3<f32>, a2: vec3<f32>, b1: vec3<f32>, b2: vec3<f32>) -> vec3<f32>
+{
+	return vec3<f32>(
+		map_range(s.x, a1.x, a2.x, b1.x, b2.x),
+		map_range(s.y, a1.y, a2.y, b1.y, b2.y),
+		map_range(s.z, a1.z, a2.z, b1.z, b2.z),
+	);
+}
+
 @fragment
 fn fs_main(
 	in: VertexOutput,
-) -> @location(0) vec4<f32> {
+) -> FragmentOutput {
+	var output: FragmentOutput;
+
+	var origin = in.chunk_position.xyz + in.local_position.xyz + 1e-2 * vec3<f32>(in.chunk_normal.xyz);
+	var offset = perframe_buffer.camera.position.xyz;
+
 	var ray: Ray;
-	ray.origin = in.chunk_position.xyz + in.local_position.xyz + 1e-2 * vec3<f32>(in.chunk_normal.xyz);
-	ray.offset = perframe_buffer.camera.position.xyz;
-	ray.direction = normalize(ray.origin - vec3<f32>(floor(f32(region_size) / 2.0)));
+	ray.origin = origin;
+	ray.offset = offset;
+	ray.direction = normalize(ray.origin - vec3<f32>(floor(f32(region_size) / 2.0) + fract(ray.offset)));
 	ray.max_distance = 1000.0;
 	// TODO see if I can eliminate the fluff?
 	ray.minimum = vec3<i32>(in.chunk_position.xyz) - 1;
@@ -655,12 +704,29 @@ fn fs_main(
 		discard;
 	}
 
-	var result = vec4(1.0);
+	var color = vec3(1.0);
 
-	if(ray_hit.block_id == u32(1)) {
-		result *= vec4(1.0, 0.0, 0.0, 1.0);	
+	var border = (textureDimensions(perlin_texture).x - region_size) / 2;
+	var pos = ray_hit.destination - vec3<f32>(global_buffer.floating_origin + border); 
+	var noise_factor = map_range3d(
+		textureLoad(perlin_texture, vec3<i32>(pos), 0).rgb,
+		vec3<f32>(0.5),
+		vec3<f32>(0.8),
+		vec3<f32>(0.0),
+		vec3<f32>(1.0)
+	).r;
+
+
+	if(ray_hit.block_id == u32(BLOCK_ID_GRASS)) {
+		color *= mix(vec3<f32>(170.0, 255.0, 21.0) / 256.0, vec3<f32>(34.0, 139.0, 34.0) / 256.0, noise_factor);
+	}
+	if(ray_hit.block_id == u32(BLOCK_ID_STONE)) {
+		color *= mix(vec3<f32>(135.0) / 256.0, vec3<f32>(20.0) / 256.0, noise_factor);
 	}
 
+	if(ray_hit.block_id == u32(BLOCK_ID_DIRT)) {
+		color *= mix(vec3<f32>(107.0, 84.0, 40.0) / 256.0, vec3<f32>(64.0, 41.0, 5.0) / 256.0, noise_factor);
+	}
 
 	var ambient = voxel_ao(
 		ray_hit.back_step
@@ -669,7 +735,11 @@ fn fs_main(
 		abs(ray_hit.normal.yzx)
 	);
 	
-	result *= vec4(vec3(0.75 + 0.25 * mix(mix(ambient.z, ambient.w, ray_hit.uv.x), mix(ambient.y, ambient.x, ray_hit.uv.x), ray_hit.uv.y)), 1.0);
+	color *= vec3(0.75 + 0.25 * mix(mix(ambient.z, ambient.w, ray_hit.uv.x), mix(ambient.y, ambient.x, ray_hit.uv.x), ray_hit.uv.y));
+	
+	var result = vec4(color, 1.0);
 
-	return result;
+	output.display = result;
+
+	return output;
 }
