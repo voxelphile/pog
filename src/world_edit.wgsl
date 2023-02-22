@@ -6,9 +6,9 @@ fn world_gen_base(position: vec3<i32>) -> u32 {
 	var pos = vec3<f32>(position);
 	var seed = 400;
 	
-	var alpha = fbm(pos, seed);
-	var beta = fbm(pos, seed + 1);
-	var gamma = fbm(pos, seed + 2);
+	var alpha = saturate(fbm(pos, seed));
+	var beta = saturate(fbm(pos, seed + 1));
+	var gamma = saturate(fbm(pos, seed + 2));
 	
 	var csample = sample_buffer.continentalness[u32(f32(alpha) * f32(max_samples))];
 	var esample = sample_buffer.erosion[u32(f32(beta) * f32(max_samples))];
@@ -34,9 +34,9 @@ fn world_gen(position: vec3<i32>) -> u32 {
 	}
 
 	var air_above = 0;
-	var max_air = 10;
+	var max_air = 5;
 
-	for(var i = 0; i < max_air; i++) {
+	for(var i = 1; i < max_air; i++) {
 		if(world_gen_base(position + vec3(0, 0, i)) == u32(BLOCK_ID_AIR)) {
 			air_above++;
 		}
@@ -46,9 +46,9 @@ fn world_gen(position: vec3<i32>) -> u32 {
 		return u32(BLOCK_ID_GRASS);
 	} else if(air_above > 0) {
 		return u32(BLOCK_ID_DIRT);
-	} else {
-		return u32(BLOCK_ID_STONE);
 	}
+	
+	return u32(BLOCK_ID_STONE);
 }
 
 @compute
