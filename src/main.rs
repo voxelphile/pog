@@ -21,12 +21,16 @@ use winit::{
     window::WindowBuilder,
 };
 use splines::{Interpolation, Key, Spline};
+use wgsl_preprocessor::ShaderBuilder;
 
 pub const REGION_SIZE: u32 = 128;
-pub const FIELD_SIZE: u32 = 256;
+pub const VIEW_DISTANCE: f32 = 128.0;
+pub const WORLD_SIZE: u32 = 1024;
 pub const CHUNK_SIZE: u32 = 4;
 pub const SAMPLE_COUNT: u32 = 1000;
 pub const MAX_BATCHES: u32 = 10;
+
+
 
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
@@ -139,11 +143,11 @@ impl World {
         perframe_data.camera.transform = perframe_data.camera.rotation.into();
         perframe_data.camera.transform[3] = Vector4 {
             x: (REGION_SIZE as f32 / 2.0)
-                + (f32::fract(perframe_data.camera.position.x)),
+                + VIEW_DISTANCE * (f32::fract(perframe_data.camera.position.x / VIEW_DISTANCE)),
             y: (REGION_SIZE as f32 / 2.0)
-                + (f32::fract(perframe_data.camera.position.y)),
+                + VIEW_DISTANCE * (f32::fract(perframe_data.camera.position.y / VIEW_DISTANCE)),
             z: (REGION_SIZE as f32 / 2.0)
-                + (f32::fract(perframe_data.camera.position.z)),
+                + VIEW_DISTANCE * (f32::fract(perframe_data.camera.position.z / VIEW_DISTANCE)),
             w: 1.0,
         };
 
@@ -418,11 +422,11 @@ struct Graphics {
     depth_texture: wgpu::Texture,
     depth_texture_view: wgpu::TextureView,
     depth_texture_sampler: wgpu::Sampler,
-    perlin_texture: wgpu::Texture,
-    perlin_texture_view: wgpu::TextureView,
-    noise_pipeline: wgpu::ComputePipeline,
-    noise_group: wgpu::BindGroup,
-    noise_storage_group: wgpu::BindGroup,
+    world_texture: wgpu::Texture,
+    world_texture_view: wgpu::TextureView,
+    world_pipeline: wgpu::ComputePipeline,
+    world_group: wgpu::BindGroup,
+    world_storage_group: wgpu::BindGroup,
     egui: Egui,
 }
 
@@ -556,19 +560,19 @@ impl Graphics {
             contents: bytemuck::cast_slice(&samples),
         });
 
-        let perlin_texture = device.create_texture(&wgpu::TextureDescriptor {
+        let world_texture = device.create_texture(&wgpu::TextureDescriptor {
             // All textures are stored as 3D, we represent our 2D texture
             // by setting depth to 1.
             size: wgpu::Extent3d {
-                width: FIELD_SIZE,
-                height: FIELD_SIZE,
-                depth_or_array_layers: FIELD_SIZE,
+                width: WORLD_SIZE,
+                height: WORLD_SIZE,
+                depth_or_array_layers: WORLD_SIZE,
             },
             mip_level_count: 1, // We'll talk about this a little later
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
             // Most images are stored using sRGB so we need to reflect that here.
-            format: wgpu::TextureFormat::Rgba32Float,
+            format: wgpu::TextureFormat::R32Uint,
             // TEXTURE_BINDING tells wgpu that we want to use this texture in shaders
             // COPY_DST means that we want to copy data to this texture
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
@@ -576,10 +580,10 @@ impl Graphics {
             view_formats: &[],
         });
 
-        let perlin_texture_view =
-            perlin_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let world_texture_view =
+            world_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let noise_group_layout =
+        let world_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -587,7 +591,7 @@ impl Graphics {
                         | wgpu::ShaderStages::FRAGMENT
                         | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Uint,
                         view_dimension: wgpu::TextureViewDimension::D3,
                         multisampled: false,
                     },
@@ -596,16 +600,16 @@ impl Graphics {
                 label: Some("bind_group_layout2"),
             });
 
-        let noise_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &noise_group_layout,
+        let world_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &world_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&perlin_texture_view),
+                resource: wgpu::BindingResource::TextureView(&world_texture_view),
             }],
             label: Some("bind_group"),
         });
 
-        let noise_storage_group_layout =
+        let world_storage_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -614,7 +618,7 @@ impl Graphics {
                         | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba32Float,
+                        format: wgpu::TextureFormat::R32Uint,
                         view_dimension: wgpu::TextureViewDimension::D3,
                     },
                     count: None,
@@ -622,11 +626,11 @@ impl Graphics {
                 label: Some("bind_group_layout2"),
             });
 
-        let noise_storage_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &noise_storage_group_layout,
+        let world_storage_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &world_storage_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&perlin_texture_view),
+                resource: wgpu::BindingResource::TextureView(&world_texture_view),
             }],
             label: Some("bind_group"),
         });
@@ -746,37 +750,38 @@ impl Graphics {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout, &noise_group_layout],
+            bind_group_layouts: &[&bind_group_layout, &world_group_layout],
             push_constant_ranges: &[],
         });
 
         let pipeline_layout2 = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout, &noise_storage_group_layout],
+            bind_group_layouts: &[&bind_group_layout, &world_storage_group_layout],
             push_constant_ranges: &[],
         });
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-
+        let world_edit_shader = Self::shader_module(&device, "world_edit.wgsl");
+        let general_shader = Self::shader_module(&device, "general.wgsl");
+        
         let perframe_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
             layout: Some(&pipeline_layout),
-            module: &shader,
+            module: &general_shader,
             entry_point: "cs_perframe",
         });
 
-        let noise_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        let world_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
             layout: Some(&pipeline_layout2),
-            module: &shader,
-            entry_point: "cs_noise",
+            module: &world_edit_shader,
+            entry_point: "cs_world",
         });
 
         let create_chunk_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: None,
                 layout: Some(&pipeline_layout),
-                module: &shader,
+                module: &general_shader,
                 entry_point: "cs_create_chunks",
             });
 
@@ -818,13 +823,13 @@ impl Graphics {
             label: Some("Render Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &general_shader,
                 entry_point: "vs_main", // 1.
                 buffers: &[],           // 2.
             },
             fragment: Some(wgpu::FragmentState {
                 // 3.
-                module: &shader,
+                module: &general_shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     // 4.
@@ -864,13 +869,13 @@ impl Graphics {
             label: Some("Render Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: &general_shader,
                 entry_point: "vs_main", // 1.
                 buffers: &[],           // 2.
             },
             fragment: Some(wgpu::FragmentState {
                 // 3.
-                module: &shader,
+                module: &general_shader,
                 entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     // 4.
@@ -943,11 +948,11 @@ impl Graphics {
             depth_texture,
             depth_texture_view,
             depth_texture_sampler,
-            noise_pipeline,
-            noise_group,
-            noise_storage_group,
-            perlin_texture,
-            perlin_texture_view,
+            world_pipeline,
+            world_group,
+            world_storage_group,
+            world_texture,
+            world_texture_view,
             egui,
         }
     }
@@ -1041,7 +1046,7 @@ impl Graphics {
             });
 
             compute_pass.set_bind_group(0, &self.bind_group, &[]);
-            compute_pass.set_bind_group(1, &self.noise_group, &[]);
+            compute_pass.set_bind_group(1, &self.world_group, &[]);
 
             compute_pass.set_pipeline(&self.perframe_pipeline);
             compute_pass.dispatch_workgroups(1, 1, 1);
@@ -1061,9 +1066,9 @@ impl Graphics {
             });
 
             compute_pass.set_bind_group(0, &self.bind_group, &[]);
-            compute_pass.set_bind_group(1, &self.noise_storage_group, &[]);
+            compute_pass.set_bind_group(1, &self.world_storage_group, &[]);
 
-            compute_pass.set_pipeline(&self.noise_pipeline);
+            compute_pass.set_pipeline(&self.world_pipeline);
             compute_pass.dispatch_workgroups_indirect(
                 &self.indirect_buffer,
                 mem::size_of::<wgpu::util::DispatchIndirect>() as u64,
@@ -1076,7 +1081,7 @@ impl Graphics {
             });
 
             compute_pass.set_bind_group(0, &self.bind_group, &[]);
-            compute_pass.set_bind_group(1, &self.noise_group, &[]);
+            compute_pass.set_bind_group(1, &self.world_group, &[]);
 
             compute_pass.set_pipeline(&self.create_chunk_pipeline);
             compute_pass.dispatch_workgroups_indirect(&self.indirect_buffer, 0);
@@ -1152,7 +1157,7 @@ impl Graphics {
             });
 
             render_pass.set_bind_group(0, &self.bind_group, &[]);
-            render_pass.set_bind_group(1, &self.noise_group, &[]);
+            render_pass.set_bind_group(1, &self.world_group, &[]);
 
             render_pass.set_pipeline(&self.front_render_pipeline);
 
@@ -1182,5 +1187,9 @@ impl Graphics {
         output.present();
 
         Ok(())
+    }
+
+    fn shader_module(device: &wgpu::Device, s: &'static str) -> wgpu::ShaderModule {
+        device.create_shader_module(ShaderBuilder::new(&format!("src/{}", s)).unwrap().build())
     }
 }

@@ -1,255 +1,15 @@
-const chunk_size = 4;
-const region_size = 128;
-const max_batches = 10;
-const max_samples = 1000;
+//!include src/base.wgsl
 
-const BLOCK_ID_AIR = 1;
-const BLOCK_ID_GRASS = 2;
-const BLOCK_ID_DIRT = 3;
-const BLOCK_ID_STONE = 4;
-
-struct Camera {
-	transform: mat4x4<f32>,
-	view: mat4x4<f32>,
-	projection: mat4x4<f32>,
-	inv_projection: mat4x4<f32>,
-	position: vec4<f32>,
-	rotation: vec4<f32>,
-	resolution: vec2<f32>,
-}
-
-struct PerframeData {
-	camera: Camera,
-	up: u32,
-	down: u32,
-	left: u32,
-	right: u32,
-	forward: u32,
-	backward: u32,
-	action1: u32,
-	action2: u32,
-	look_x: f32,
-	look_y: f32,
-};
-
-@group(0) @binding(0) var<storage> perframe_buffer : PerframeData;
-
-struct IndirectData {
-	create_chunk_x: u32,
-	create_chunk_y: u32,
-	create_chunk_z: u32,
-	create_noise_x: u32,
-	create_noise_y: u32,
-	create_noise_z: u32,
-}
-
-@group(0) @binding(1) var<storage, read_write> indirect_buffer : IndirectData;
-
-struct GlobalData {
-	load: i32,
-	dst: f32,
-	floating_origin: vec3<i32>,
-}
-
-@group(0) @binding(2) var<storage, read_write> global_buffer : GlobalData;
-
-struct BatchChunk {
-	position: vec4<i32>,
-}
-
-struct Batch {
-	batch_vertex_count: u32,
-    	batch_instance_count: atomic<u32>,
-    	batch_base_vertex: u32,
-    	batch_base_instance: u32,
-	batch_chunks: array<BatchChunk, 100000>,
-}
-
-struct BatchData {
-	batch_count: atomic<u32>,
-	batches: array<Batch>,
-};
-
-@group(0) @binding(3) var<storage, read_write> batch_buffer : BatchData;
-
-struct SampleData {
-	continentalness: array<f32, 1000>,
-	erosion: array<f32, 1000>,
-	pandv: array<f32, 1000>,
-};
-
-@group(0) @binding(4) var<storage> sample_buffer : SampleData;
-
-@group(1) @binding(0) var perlin_texture: texture_3d<f32>;
-@group(1) @binding(0) var perlin_storage: texture_storage_3d<rgba32float, write>;
-
-fn hash1d(a: u32) -> u32 {
-	var x = a;
-	x += ( x << 10u );
-    	x ^= ( x >>  6u );
-    	x += ( x <<  3u );
-    	x ^= ( x >> 11u );
-    	x += ( x << 15u );
-    	return x;
-}
-
-fn hash2d(v: vec2<u32>) -> u32 {
-	return hash1d(v.x ^ hash1d(v.y));
-}
-
-fn hash3d(v: vec3<u32>) -> u32 {
-	return hash1d(v.x ^ hash1d(v.y) ^ hash1d(v.z));
-}
-
-fn hash4d(v: vec4<u32>) -> u32 {
-	return hash1d(v.x ^ hash1d(v.y) ^ hash1d(v.z) ^ hash1d(v.w));
-}
-
-fn float_construct(m: u32) -> f32 {
-	var x = m;
-
-	var ieee_mantissa = 0x007FFFFFu;
-	var ieee_one = 0x3F800000u;
-
-	x &= ieee_mantissa;
-	x |= ieee_one;
-
-	var f = bitcast<f32>(x);
-	return f - 1.0;
-}
-
-fn random1d(x: f32) -> f32 {
-	return float_construct(hash1d(bitcast<u32>(x)));
-}
-
-fn random2d(v: vec2<f32>) -> f32 {
-	return float_construct(hash2d(vec2<u32>(
-		bitcast<u32>(v.x),
-		bitcast<u32>(v.y)
-	)));
-}
-
-fn random3d(v: vec3<f32>) -> f32 {
-	return float_construct(hash3d(vec3<u32>(
-		bitcast<u32>(v.x),
-		bitcast<u32>(v.y),
-		bitcast<u32>(v.z)
-	)));
-}
-
-fn random4d(v: vec4<f32>) -> f32 {
-	return float_construct(hash4d(vec4<u32>(
-		bitcast<u32>(v.x),
-		bitcast<u32>(v.y),
-		bitcast<u32>(v.z),
-		bitcast<u32>(v.w),
-	)));
-}
-
-fn random_gradient(position: vec3<i32>, seed: i32) -> vec3<f32> {
-	var alpha = random4d(vec4<f32>(vec3<f32>(position.xyz), f32(seed)));
-	var beta = random4d(vec4<f32>(vec3<f32>(position.xyz), f32(seed) + 1.0));
-
-	return normalize(vec3<f32>(
-		cos(alpha) * cos(beta),
-		sin(beta),
-		sin(alpha) * cos(beta)
-	));
-}
-
-fn dot_grid_gradient(i: vec3<i32>, p: vec3<f32>, seed: i32) -> f32 {
-	return dot(random_gradient(i, seed), p - vec3<f32>(i));
-}
-
-fn perlin(position: vec3<f32>, seed: i32) -> f32 {
-	var m0 = vec3<i32>(floor(position));
-
-	var m1 = m0 + 1;
-
-	var s = position - vec3<f32>(m0);
-
-	var n0: f32;
-	var n1: f32;
-	var ix0: f32;
-	var ix1: f32;
-	var jx0: f32;
-	var jx1: f32;
-	var k: f32;
-
-	n0 = dot_grid_gradient(vec3<i32>(m0.x, m0.y, m0.z), position, seed);
-	n1 = dot_grid_gradient(vec3<i32>(m1.x, m0.y, m0.z), position, seed);
-	ix0 = mix(n0, n1, s.x);
-
-	n0 = dot_grid_gradient(vec3<i32>(m0.x, m1.y, m0.z), position, seed);
-	n1 = dot_grid_gradient(vec3<i32>(m1.x, m1.y, m0.z), position, seed);
-	ix1 = mix(n0, n1, s.x);
-
-	jx0 = mix(ix0, ix1, s.y); 
-	
-	n0 = dot_grid_gradient(vec3<i32>(m0.x, m0.y, m1.z), position, seed);
-	n1 = dot_grid_gradient(vec3<i32>(m1.x, m0.y, m1.z), position, seed);
-	ix0 = mix(n0, n1, s.x);
-
-	n0 = dot_grid_gradient(vec3<i32>(m0.x, m1.y, m1.z), position, seed);
-	n1 = dot_grid_gradient(vec3<i32>(m1.x, m1.y, m1.z), position, seed);
-	ix1 = mix(n0, n1, s.x);
-
-	jx1 = mix(ix0, ix1, s.y); 
-
-	k = mix(jx0, jx1, s.z);
-
-	return k;
-}
-
-fn fbm(position: vec3<f32>, seed: i32) -> f32 {
-	var octaves = 10;
-	var lacunarity = 2.0;
-	var gain = 0.5;
-	var amplitude = 1.0;
-	var frequency = 0.05;
-	var height = 0.0;
-
-	for(var i = 0; i < octaves; i++) {
-		height += amplitude * perlin(frequency * position, seed);
-		frequency *= lacunarity;
-		amplitude *= gain;
-	}
-
-	return height;
-}
-
-fn world_gen(position: vec3<i32>) -> u32 {
-	var border = (textureDimensions(perlin_texture).x - region_size) / 2;
-	var pos = vec3<f32>(position) 
-		- vec3<f32>(global_buffer.floating_origin)
-		+ vec3<f32>(f32(border)); 
-	pos.z = 0.0;
-	var perlin = textureLoad(perlin_texture, vec3<i32>(pos), 0).rgb;
-	var csample = sample_buffer.continentalness[u32(f32(perlin.r) * f32(max_samples))];
-	var esample = sample_buffer.erosion[u32(f32(perlin.g) * f32(max_samples))];
-	var pandvsample = sample_buffer.pandv[u32(f32(perlin.b) * f32(max_samples))];
-	var base_height = 60.0;
-	var c_height = mix(base_height / 2.0, base_height * 2.0, csample);
-	var e_height = mix(c_height, base_height, esample);
-	var height = mix(mix(base_height / 4.0, base_height * 4.0, pandvsample), base_height, 1.0 - esample);
-
-	if(position.z == i32(height)) {
-		return u32(BLOCK_ID_GRASS);
-	} else if(position.z < i32(height) && position.z > i32(height - 10.0)) {
-		return u32(BLOCK_ID_DIRT);
-	} else if(position.z < i32(height)) {
-		return u32(BLOCK_ID_STONE);
-	}
-
-	return u32(BLOCK_ID_AIR);
-}
+@group(1) @binding(0) var world_texture: texture_3d<u32>;
 
 @compute
 @workgroup_size(1)
 fn cs_perframe() {
 	var size: vec3<i32> = vec3<i32>(region_size);
 	
-	if(global_buffer.load == 0 || true) {
+	var dst = distance(vec3<f32>(global_buffer.floating_origin), perframe_buffer.camera.position.xyz);
+	
+	if(global_buffer.load == 0 || dst > view_distance) {
 		indirect_buffer.create_chunk_x = u32(size.x / chunk_size);
 		indirect_buffer.create_chunk_y = u32(size.y / chunk_size);
 		indirect_buffer.create_chunk_z = u32(size.z / chunk_size);
@@ -260,51 +20,22 @@ fn cs_perframe() {
 			batch_buffer.batches[i].batch_instance_count = u32(0);
 			batch_buffer.batches[i].batch_base_instance = u32(i * 100000);
 		}
-	} else {
-		indirect_buffer.create_chunk_x = u32(0);
-		indirect_buffer.create_chunk_y = u32(0);
-		indirect_buffer.create_chunk_z = u32(0);
-	}
-
-	var dst = distance(vec3<f32>(global_buffer.floating_origin), perframe_buffer.camera.position.xyz);
-
-	var border = (textureDimensions(perlin_texture).x - region_size) / 2;
-	
-	if(global_buffer.load == 0 || dst > f32(border)) {
+		
 		global_buffer.floating_origin = vec3<i32>(perframe_buffer.camera.position.xyz);
-		var size: vec3<i32> = vec3<i32>(textureDimensions(perlin_texture).xyz);
+		var size: vec3<i32> = vec3<i32>(textureDimensions(world_texture).xyz);
 		indirect_buffer.create_noise_x = u32(size.x / 4);
 		indirect_buffer.create_noise_y = u32(size.y / 4);
 		indirect_buffer.create_noise_z = u32(size.z / 4);
 	} else {
+		indirect_buffer.create_chunk_x = u32(0);
+		indirect_buffer.create_chunk_y = u32(0);
+		indirect_buffer.create_chunk_z = u32(0);
 		indirect_buffer.create_noise_x = u32(0);
 		indirect_buffer.create_noise_y = u32(0);
 		indirect_buffer.create_noise_z = u32(0);
 	}
 
 	global_buffer.load = 1;
-}
-
-@compute
-@workgroup_size(4,4,4)
-fn cs_noise(
-	@builtin(global_invocation_id) gid: vec3<u32>,
-) {
-	var seed = 46029;
-
-	var pos = vec3<f32>(gid) + vec3<f32>(global_buffer.floating_origin);
-
-	var alpha = fbm(pos, seed);
-	var beta = fbm(pos, seed + 1);
-	var gamma = fbm(pos, seed + 2);
-	var delta = fbm(pos, seed + 3);
-
-	textureStore(perlin_storage, vec3<i32>(gid), vec4<f32>(
-		alpha,
-		beta,
-		gamma,
-		delta
-	));
 }
 
 var<workgroup> solid_blocks: atomic<i32>;
@@ -317,42 +48,31 @@ fn cs_create_chunks(
 ) {
 	var voxel_pos = vec3<i32>(gid);
 
-	var block_id = world_gen(
-		voxel_pos
-		+ vec3<i32>(perframe_buffer.camera.position.xyz)
-	);
-
-	if(block_id != u32(BLOCK_ID_AIR)) {
-		var up_block = world_gen(
+	if(voxel_query(voxel_pos)) {
+		var up_block = !voxel_query(
 			voxel_pos
-			+ vec3<i32>(perframe_buffer.camera.position.xyz)
 			+ vec3<i32>(0, 0, 1)
-		) == u32(BLOCK_ID_AIR);
-		var down_block = world_gen(
+		);
+		var down_block = !voxel_query(
 			voxel_pos
-			+ vec3<i32>(perframe_buffer.camera.position.xyz)
 			+ vec3<i32>(0, 0, -1)
-		) == u32(BLOCK_ID_AIR);
-		var left_block = world_gen(
+		);
+		var left_block = !voxel_query(
 			voxel_pos
-			+ vec3<i32>(perframe_buffer.camera.position.xyz)
 			+ vec3<i32>(0, -1, 0)
-		) == u32(BLOCK_ID_AIR);
-		var right_block = world_gen(
+		);
+		var right_block = !voxel_query(
 			voxel_pos
-			+ vec3<i32>(perframe_buffer.camera.position.xyz)
 			+ vec3<i32>(0, 1, 0)
-		) == u32(BLOCK_ID_AIR);
-		var forward_block = world_gen(
+		);
+		var forward_block = !voxel_query(
 			voxel_pos
-			+ vec3<i32>(perframe_buffer.camera.position.xyz)
 			+ vec3<i32>(1, 0, 0)
-		) == u32(BLOCK_ID_AIR);
-		var backward_block = world_gen(
+		);
+		var backward_block = !voxel_query(
 			voxel_pos
-			+ vec3<i32>(perframe_buffer.camera.position.xyz)
 			+ vec3<i32>(-1, 0, 0)
-		) == u32(BLOCK_ID_AIR);
+		);
 		
 		var exposed = up_block 
 			|| down_block 
@@ -593,15 +313,9 @@ fn ray_cast_check_failure(state: ptr<function, RayState>) -> bool {
 }
 
 fn ray_cast_check_success(state: ptr<function, RayState>) -> bool {
-	
-	var block_id = world_gen(
-		(*state).position
-		+ vec3<i32>(perframe_buffer.camera.position.xyz)
-	);
-
-	if(block_id != u32(BLOCK_ID_AIR)) {
+	if(voxel_query((*state).position)) {
 		(*state).id = RAY_STATE_VOXEL_FOUND;
-		(*state).block_id = block_id;
+		(*state).block_id = voxel_id((*state).position);
 		return true;
 	}
 
@@ -639,14 +353,15 @@ fn vertex_ao(side: vec2<f32>, corner: f32) -> f32 {
 	return (side.x + side.y + max(corner, side.x * side.y)) / 3.0;
 }
 
+fn voxel_id(position: vec3<i32>) -> u32 {
+	var texture_position = position
+		- global_buffer.floating_origin
+		+ textureDimensions(world_texture) / 2;
+		return textureLoad(world_texture, texture_position, 0).r;
+}
+
 fn voxel_query(position: vec3<i32>) -> bool {
-	var block_id = world_gen(position);
-
-	if(block_id != u32(BLOCK_ID_AIR)) {
-		return true;
-	}
-
-	return false;
+	return voxel_id(position) != u32(BLOCK_ID_AIR); 
 }
 
 fn voxel_ao(position: vec3<i32>, d1: vec3<i32>, d2: vec3<i32>) -> vec4<f32> {
@@ -744,20 +459,22 @@ fn fs_main(
 
 	var color = vec3(1.0);
 
-	var border = (textureDimensions(perlin_texture).x - region_size) / 2;
+/*
+	var border = (textureDimensions(world_texture).x - region_size) / 2;
 	var pos = ray_hit.destination 
 		+ floor(perframe_buffer.camera.position.xyz)
 		- vec3<f32>(global_buffer.floating_origin)
 		+ vec3<f32>(f32(border)); 
-	var noise_factor = saturate(
+*/
+	var noise_factor = 0.5; /* saturate(
 		map_range(
-			textureLoad(perlin_texture, vec3<i32>(pos), 0).r, 
+			textureLoad(world_texture, vec3<i32>(pos), 0).r, 
 			-sqrt(3.0) / 2.0, 
 			sqrt(3.0) / 2.0, 
 			-1.5, 
 			2.5
 		)
-	);
+	);*/
 
 	if(ray_hit.block_id == u32(BLOCK_ID_GRASS)) {
 		color *= mix(vec3<f32>(84.0, 127.0, 68.0) / 256.0, vec3<f32>(34.0, 139.0, 34.0) / 256.0, noise_factor);
@@ -772,8 +489,7 @@ fn fs_main(
 	}
 
 	var ambient = voxel_ao(
-		ray_hit.back_step
-			+ vec3<i32>(perframe_buffer.camera.position.xyz),
+		ray_hit.back_step,
 		abs(ray_hit.normal.zxy), 
 		abs(ray_hit.normal.yzx)
 	);
