@@ -34,7 +34,7 @@ fn world_gen(position: vec3<i32>) -> u32 {
 	}
 
 	var air_above = 0;
-	var max_air = 5;
+	var max_air = 3;
 
 	for(var i = 1; i < max_air; i++) {
 		if(world_gen_base(position + vec3(0, 0, i)) == u32(BLOCK_ID_AIR)) {

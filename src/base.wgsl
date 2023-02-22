@@ -1,5 +1,5 @@
 const chunk_size = 4;
-const region_size = 128;
+const region_size = 256;
 const max_batches = 10;
 const max_samples = 1000;
 const refresh_distance = 16.0;

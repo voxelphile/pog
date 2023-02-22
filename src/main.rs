@@ -23,9 +23,9 @@ use winit::{
 use splines::{Interpolation, Key, Spline};
 use wgsl_preprocessor::ShaderBuilder;
 
-pub const REGION_SIZE: u32 = 128;
+pub const REGION_SIZE: u32 = 256;
 pub const VIEW_DISTANCE: f32 = 128.0;
-pub const WORLD_SIZE: u32 = 256;
+pub const WORLD_SIZE: u32 = 300;
 pub const CHUNK_SIZE: u32 = 4;
 pub const SAMPLE_COUNT: u32 = 1000;
 pub const MAX_BATCHES: u32 = 10;
