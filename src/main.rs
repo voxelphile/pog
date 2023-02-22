@@ -25,7 +25,7 @@ use wgsl_preprocessor::ShaderBuilder;
 
 pub const REGION_SIZE: u32 = 128;
 pub const VIEW_DISTANCE: f32 = 128.0;
-pub const WORLD_SIZE: u32 = 1024;
+pub const WORLD_SIZE: u32 = 256;
 pub const CHUNK_SIZE: u32 = 4;
 pub const SAMPLE_COUNT: u32 = 1000;
 pub const MAX_BATCHES: u32 = 10;
@@ -143,11 +143,11 @@ impl World {
         perframe_data.camera.transform = perframe_data.camera.rotation.into();
         perframe_data.camera.transform[3] = Vector4 {
             x: (REGION_SIZE as f32 / 2.0)
-                + VIEW_DISTANCE * (f32::fract(perframe_data.camera.position.x / VIEW_DISTANCE)),
+                + (f32::fract(perframe_data.camera.position.x)),
             y: (REGION_SIZE as f32 / 2.0)
-                + VIEW_DISTANCE * (f32::fract(perframe_data.camera.position.y / VIEW_DISTANCE)),
+                + (f32::fract(perframe_data.camera.position.y)),
             z: (REGION_SIZE as f32 / 2.0)
-                + VIEW_DISTANCE * (f32::fract(perframe_data.camera.position.z / VIEW_DISTANCE)),
+                + (f32::fract(perframe_data.camera.position.z)),
             w: 1.0,
         };
 
@@ -194,7 +194,7 @@ impl State {
                 view: Matrix4::<f32>::identity(),
                 projection: Matrix4::<f32>::identity(),
                 inv_projection: Matrix4::<f32>::identity(),
-                position: Vector4::<f32>::new(0.0, 0.0, 0.0, 1.0),
+                position: Vector4::<f32>::new(0.0, 0.0, 60.0, 1.0),
                 rotation: Quaternion::<f32>::new(0.0, 0.0, 0.0, 0.0),
                 resolution: Vector2::<f32>::new(0.0, 0.0),
             },

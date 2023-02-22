@@ -2,7 +2,7 @@ const chunk_size = 4;
 const region_size = 128;
 const max_batches = 10;
 const max_samples = 1000;
-const view_distance = 128.0;
+const refresh_distance = 16.0;
 
 const BLOCK_ID_AIR = 1;
 const BLOCK_ID_GRASS = 2;

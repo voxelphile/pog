@@ -9,7 +9,7 @@ fn cs_perframe() {
 	
 	var dst = distance(vec3<f32>(global_buffer.floating_origin), perframe_buffer.camera.position.xyz);
 	
-	if(global_buffer.load == 0 || dst > view_distance) {
+	if(true) {
 		indirect_buffer.create_chunk_x = u32(size.x / chunk_size);
 		indirect_buffer.create_chunk_y = u32(size.y / chunk_size);
 		indirect_buffer.create_chunk_z = u32(size.z / chunk_size);
@@ -20,6 +20,12 @@ fn cs_perframe() {
 			batch_buffer.batches[i].batch_instance_count = u32(0);
 			batch_buffer.batches[i].batch_base_instance = u32(i * 100000);
 		}
+
+	}
+	
+	var border = (textureDimensions(world_texture).x - region_size) / 2;
+
+	if(global_buffer.load == 0 || dst > f32(border)) {
 		
 		global_buffer.floating_origin = vec3<i32>(perframe_buffer.camera.position.xyz);
 		var size: vec3<i32> = vec3<i32>(textureDimensions(world_texture).xyz);
@@ -27,9 +33,6 @@ fn cs_perframe() {
 		indirect_buffer.create_noise_y = u32(size.y / 4);
 		indirect_buffer.create_noise_z = u32(size.z / 4);
 	} else {
-		indirect_buffer.create_chunk_x = u32(0);
-		indirect_buffer.create_chunk_y = u32(0);
-		indirect_buffer.create_chunk_z = u32(0);
 		indirect_buffer.create_noise_x = u32(0);
 		indirect_buffer.create_noise_y = u32(0);
 		indirect_buffer.create_noise_z = u32(0);
@@ -48,42 +51,16 @@ fn cs_create_chunks(
 ) {
 	var voxel_pos = vec3<i32>(gid);
 
-	if(voxel_query(voxel_pos)) {
-		var up_block = !voxel_query(
-			voxel_pos
-			+ vec3<i32>(0, 0, 1)
-		);
-		var down_block = !voxel_query(
-			voxel_pos
-			+ vec3<i32>(0, 0, -1)
-		);
-		var left_block = !voxel_query(
-			voxel_pos
-			+ vec3<i32>(0, -1, 0)
-		);
-		var right_block = !voxel_query(
-			voxel_pos
-			+ vec3<i32>(0, 1, 0)
-		);
-		var forward_block = !voxel_query(
-			voxel_pos
-			+ vec3<i32>(1, 0, 0)
-		);
-		var backward_block = !voxel_query(
-			voxel_pos
-			+ vec3<i32>(-1, 0, 0)
-		);
-		
-		var exposed = up_block 
-			|| down_block 
-			|| left_block 
-			|| right_block 
-			|| forward_block 
-			|| backward_block;
+	if(lid == u32(0) && voxel_exposed(voxel_pos)) {	
+		solid_blocks += 1;
+	}
+	
+	workgroupBarrier();
 
-		if(exposed) {
-			atomicAdd(&solid_blocks, 1);
-		}
+	var sb = atomicLoad(&solid_blocks);
+
+	if(lid != u32(0) && sb == 0 && voxel_exposed(voxel_pos)) {
+		solid_blocks += 1;	
 	}
 
 	workgroupBarrier();
@@ -190,7 +167,11 @@ fn vs_main(
 	out.chunk_normal = vec4(normals[j / u32(6)], 0.0);
 	out.local_position = vec4(f32(chunk_size) * offsets[indices[j]], 1.0);
 
-	out.chunk_position = vec4<f32>(f32(chunk_size) * vec3<f32>(batch_buffer.batches[x].batch_chunks[y].position.xyz), 1.0);
+	out.chunk_position = vec4<f32>(
+		f32(chunk_size) 
+		* vec3<f32>(batch_buffer.batches[x].batch_chunks[y].position.xyz), 
+		1.0
+	);
 
 	out.world_position = vec4<f32>(out.local_position.xyz + out.chunk_position.xyz, 1.0);
     	out.clip_position = perframe_buffer.camera.projection * perframe_buffer.camera.view * out.world_position;
@@ -353,10 +334,49 @@ fn vertex_ao(side: vec2<f32>, corner: f32) -> f32 {
 	return (side.x + side.y + max(corner, side.x * side.y)) / 3.0;
 }
 
+fn voxel_exposed(position: vec3<i32>) -> bool {
+	if(voxel_query(position)) {
+		var exposed =
+			!voxel_query(
+				position
+				+ vec3<i32>(0, 0, 1)
+			) 
+			|| !voxel_query(
+				position
+				+ vec3<i32>(0, 0, -1)
+			) 
+			|| !voxel_query(
+				position
+				+ vec3<i32>(0, -1, 0)
+			) 
+			|| !voxel_query(
+				position
+				+ vec3<i32>(0, 1, 0)
+			) 
+			|| !voxel_query(
+				position
+				+ vec3<i32>(1, 0, 0)
+			) 
+			|| !voxel_query(
+				position
+				+ vec3<i32>(-1, 0, 0)
+			);
+
+		if(exposed) {
+			return true;
+		}
+	}
+	
+	return false;
+
+}	
+
 fn voxel_id(position: vec3<i32>) -> u32 {
 	var texture_position = position
 		- global_buffer.floating_origin
-		+ textureDimensions(world_texture) / 2;
+		+ vec3<i32>(perframe_buffer.camera.position.xyz)
+		+ textureDimensions(world_texture) / 2
+		- vec3<i32>(region_size / 2);
 		return textureLoad(world_texture, texture_position, 0).r;
 }
 
