@@ -1,5 +1,5 @@
 const chunk_size = 4;
-const region_size = 256;
+const region_size = 64;
 const max_batches = 10;
 const max_samples = 1000;
 const refresh_distance = 16.0;
@@ -19,8 +19,7 @@ struct Camera {
 	resolution: vec2<f32>,
 }
 
-struct PerframeData {
-	camera: Camera,
+struct Input {
 	up: u32,
 	down: u32,
 	left: u32,
@@ -31,6 +30,11 @@ struct PerframeData {
 	action2: u32,
 	look_x: f32,
 	look_y: f32,
+}
+
+struct PerframeData {
+	camera: Camera,
+	input: Input,
 };
 
 @group(0) @binding(0) var<storage> perframe_buffer : PerframeData;

@@ -3,6 +3,7 @@ use cgmath::{
     Deg, Euler, InnerSpace, Matrix4, PerspectiveFov, Quaternion, Rad, Rotation3, SquareMatrix,
     Vector2, Vector3, Vector4,
 };
+use legion::*;
 use noise::{NoiseFn, Seedable, Simplex};
 use std::{
     future::Future,
@@ -14,23 +15,20 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wgpu::util::DeviceExt;
+use wgsl_preprocessor::ShaderBuilder;
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
     window::Window,
     window::WindowBuilder,
 };
-use splines::{Interpolation, Key, Spline};
-use wgsl_preprocessor::ShaderBuilder;
 
-pub const REGION_SIZE: u32 = 256;
+pub const REGION_SIZE: u32 = 64;
 pub const VIEW_DISTANCE: f32 = 128.0;
 pub const WORLD_SIZE: u32 = 300;
 pub const CHUNK_SIZE: u32 = 4;
 pub const SAMPLE_COUNT: u32 = 1000;
 pub const MAX_BATCHES: u32 = 10;
-
-
 
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
@@ -51,10 +49,104 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-struct World;
+pub struct Time {
+    delta_time: f32,
+}
 
-impl World {
-    fn continentalness() -> splines::Spline<f32, f32> {
+#[system]
+fn ui(
+    #[resource] egui_context: &mut EguiContext,
+    #[resource] egui_io: &mut EguiIo,
+) {
+    egui_io.full_output = Some(egui_context.run(egui_io.window_input.take().unwrap(), |ctx| {
+        egui::Window::new("Settings").show(ctx, |ui| {});
+    }));
+}
+
+#[system]
+fn camera(
+    #[resource] time: &Time, 
+    #[resource] camera: &mut Camera,
+) {
+    camera.position[3] = 1.0;
+
+    camera.transform = camera.rotation.into();
+    camera.transform[3] = Vector4 {
+        x: (REGION_SIZE as f32 / 2.0) + (f32::fract(camera.position.x)),
+        y: (REGION_SIZE as f32 / 2.0) + (f32::fract(camera.position.y)),
+        z: (REGION_SIZE as f32 / 2.0) + (f32::fract(camera.position.z)),
+        w: 1.0,
+    };
+
+    camera.view = camera.transform.invert().unwrap();
+
+    camera.projection = OPENGL_TO_WGPU_MATRIX
+        * Matrix4::from(
+            cgmath::PerspectiveFov::<f32> {
+                fovy: Deg(90.0).into(),
+                aspect: camera.resolution.x / camera.resolution.y,
+                near: 0.1,
+                far: 1000.0,
+            }
+            .to_perspective(),
+        );
+
+    camera.inv_projection = camera.projection.invert().unwrap();
+}
+#[system]
+fn input(
+    #[resource] time: &Time, 
+    #[resource] camera: &mut Camera,
+    #[resource] input: &mut Input
+) {
+    const sens: f32 = 0.0002;
+
+    let Time { delta_time } = time;
+
+    let rot_z = Quaternion::from_angle_z(Rad(input.rot_z));
+
+    camera.rotation = rot_z;
+
+    let rot_x = Quaternion::from_angle_x(Rad(input.rot_x));
+
+    camera.rotation = camera.rotation * rot_x;
+
+    let mut dx = input.right as f32 - input.left as f32;
+    let mut dy = input.forward as f32 - input.backward as f32;
+    let mut dz = input.up as f32 - input.down as f32;
+
+    let mut adjusted_movement = (rot_z
+        * Vector3 {
+            x: dx,
+            y: dy,
+            z: 0.0,
+        });
+
+    if adjusted_movement.dot(adjusted_movement) != 0.0 {
+        adjusted_movement = adjusted_movement.normalize();
+    }
+
+    dx = adjusted_movement.x;
+    dy = adjusted_movement.y;
+
+    const SPEED: f32 = 20.0;
+
+    dx *= SPEED * delta_time;
+    dy *= SPEED * delta_time;
+    dz *= SPEED * delta_time;
+
+    camera.position += Vector4 {
+        x: dx,
+        y: dy,
+        z: dz,
+        w: 0.0,
+    };
+}
+
+mod world_gen {
+    use splines::*;
+
+    pub fn continentalness() -> splines::Spline<f32, f32> {
         Spline::from_vec(vec![
             Key::new(0.0, 1.0, Interpolation::Cosine),
             Key::new(1.0 / 11.0, 0.1, Interpolation::Cosine),
@@ -67,8 +159,8 @@ impl World {
             Key::new(1.0, 1.0, Interpolation::default()),
         ])
     }
-    
-    fn erosion() -> splines::Spline<f32, f32> {
+
+    pub fn erosion() -> splines::Spline<f32, f32> {
         Spline::from_vec(vec![
             Key::new(0.0, 1.0, Interpolation::Cosine),
             Key::new(1.5 / 9.0, 5.5 / 8.0, Interpolation::Cosine),
@@ -83,8 +175,8 @@ impl World {
             Key::new(1.0, 0.5, Interpolation::default()),
         ])
     }
-    
-    fn pandv() -> splines::Spline<f32, f32> {
+
+    pub fn pandv() -> splines::Spline<f32, f32> {
         Spline::from_vec(vec![
             Key::new(0.0, 0.0, Interpolation::Cosine),
             Key::new(1.0 / 5.0, 1.0 / 7.0, Interpolation::Cosine),
@@ -95,101 +187,23 @@ impl World {
             Key::new(1.0, 0.8, Interpolation::default()),
         ])
     }
-
-    fn update(delta_time: f32, perframe_data: &mut PerframeData) {
-        const sens: f32 = 0.0002;
-
-        let rot_z = Quaternion::from_angle_z(Rad(perframe_data.rot_z));
-
-        perframe_data.camera.rotation = rot_z;
-
-        let rot_x = Quaternion::from_angle_x(Rad(perframe_data.rot_x));
-
-        perframe_data.camera.rotation = perframe_data.camera.rotation * rot_x;
-
-        let mut dx = perframe_data.right as f32 - perframe_data.left as f32;
-        let mut dy = perframe_data.forward as f32 - perframe_data.backward as f32;
-        let mut dz = perframe_data.up as f32 - perframe_data.down as f32;
-
-        let mut adjusted_movement = (rot_z
-            * Vector3 {
-                x: dx,
-                y: dy,
-                z: 0.0,
-            });
-
-        if adjusted_movement.dot(adjusted_movement) != 0.0 {
-            adjusted_movement = adjusted_movement.normalize();
-        }
-
-        dx = adjusted_movement.x;
-        dy = adjusted_movement.y;
-
-        const SPEED: f32 = 20.0;
-
-        dx *= SPEED * delta_time;
-        dy *= SPEED * delta_time;
-        dz *= SPEED * delta_time;
-
-        perframe_data.camera.position += Vector4 {
-            x: dx,
-            y: dy,
-            z: dz,
-            w: 0.0,
-        };
-
-        perframe_data.camera.position[3] = 1.0;
-
-        perframe_data.camera.transform = perframe_data.camera.rotation.into();
-        perframe_data.camera.transform[3] = Vector4 {
-            x: (REGION_SIZE as f32 / 2.0)
-                + (f32::fract(perframe_data.camera.position.x)),
-            y: (REGION_SIZE as f32 / 2.0)
-                + (f32::fract(perframe_data.camera.position.y)),
-            z: (REGION_SIZE as f32 / 2.0)
-                + (f32::fract(perframe_data.camera.position.z)),
-            w: 1.0,
-        };
-
-        perframe_data.camera.view = perframe_data.camera.transform.invert().unwrap();
-
-        perframe_data.camera.projection = OPENGL_TO_WGPU_MATRIX
-            * Matrix4::from(
-                cgmath::PerspectiveFov::<f32> {
-                    fovy: Deg(90.0).into(),
-                    aspect: perframe_data.camera.resolution.x / perframe_data.camera.resolution.y,
-                    near: 0.1,
-                    far: 1000.0,
-                }
-                .to_perspective(),
-            );
-
-        perframe_data.camera.inv_projection = perframe_data.camera.projection.invert().unwrap();
-    }
 }
 
 struct State {
     event_loop: EventLoop<()>,
     graphics: Graphics,
     world: World,
+    resources: Resources,
 }
 
 impl State {
     async fn new() -> Self {
         let event_loop = EventLoop::new();
-        Self {
-            graphics: Graphics::new(&event_loop).await,
-            world: World,
-            event_loop,
-        }
-    }
 
-    fn run(mut self) {
-        let Self { event_loop, .. } = self;
+        let mut resources = Resources::default();
 
-        let mut cursor_captured = false;
-        let mut perframe_data = PerframeData {
-            camera: Camera {
+        resources.insert(
+        Camera {
                 transform: Matrix4::<f32>::identity(),
                 view: Matrix4::<f32>::identity(),
                 projection: Matrix4::<f32>::identity(),
@@ -197,7 +211,9 @@ impl State {
                 position: Vector4::<f32>::new(0.0, 0.0, 60.0, 1.0),
                 rotation: Quaternion::<f32>::new(0.0, 0.0, 0.0, 0.0),
                 resolution: Vector2::<f32>::new(0.0, 0.0),
-            },
+        });
+
+        resources.insert(Input {
             up: 0,
             down: 0,
             left: 0,
@@ -208,7 +224,40 @@ impl State {
             action2: 0,
             rot_x: 0.0,
             rot_z: 0.0,
-        };
+        });
+
+        let world = World::default();
+
+        let graphics = Graphics::new(&event_loop).await;
+
+        resources.insert(egui_wgpu::Renderer::new(
+            &graphics.device,
+            graphics.surface_format,
+            Some(wgpu::TextureFormat::Depth32Float),
+            1,
+        ));
+
+        resources.insert(egui_winit::State::new(&event_loop));
+
+        resources.insert(egui::Context::default());
+
+        resources.insert(EguiIo { 
+            full_output: None,
+            window_input: None,
+        });
+
+        Self {
+            graphics,
+            world,
+            resources,
+            event_loop,
+        }
+    }
+
+    fn run(mut self) {
+        let Self { event_loop, .. } = self;
+
+        let mut cursor_captured = false;
 
         let mut last_instant = time::Instant::now();
 
@@ -217,28 +266,38 @@ impl State {
                 ref event,
                 window_id,
             } if window_id == self.graphics.window.id() => {
-                let egui_response = self
-                    .graphics
-                    .egui
-                    .state
-                    .on_event(&self.graphics.egui.context, event);
+                let mut egui_state = self.resources.get_mut::<EguiState>().unwrap();
+                let mut egui_context = self.resources.get::<EguiContext>().unwrap();
+
+                let egui_response = egui_state
+                    .on_event(&egui_context, event);
 
                 if (egui_response.consumed) {
                     return;
                 }
 
+                let mut camera = self
+                    .resources
+                    .get_mut::<Camera>()
+                    .expect("Camera not added");
+                
+                let mut input = self
+                    .resources
+                    .get_mut::<Input>()
+                    .expect("Input not added");
+
                 match event {
                     WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
                     WindowEvent::Resized(physical_size) => {
                         self.graphics.window_size = *physical_size;
-                        perframe_data.camera.resolution = Vector2 {
+                        camera.resolution = Vector2 {
                             x: physical_size.width as f32,
                             y: physical_size.height as f32,
                         };
                     }
                     WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
                         self.graphics.window_size = **new_inner_size;
-                        perframe_data.camera.resolution = Vector2 {
+                        camera.resolution = Vector2 {
                             x: new_inner_size.width as f32,
                             y: new_inner_size.height as f32,
                         };
@@ -262,10 +321,10 @@ impl State {
 
                             const SENS: f32 = 0.0002;
 
-                            perframe_data.rot_x -= SENS * y_diff as f32;
-                            perframe_data.rot_x =
-                                f32::clamp(perframe_data.rot_x, 0.0, 2.0 * std::f32::consts::PI);
-                            perframe_data.rot_z -= SENS * x_diff as f32;
+                            input.rot_x -= SENS * y_diff as f32;
+                            input.rot_x =
+                                f32::clamp(input.rot_x, 0.0, 2.0 * std::f32::consts::PI);
+                            input.rot_z -= SENS * x_diff as f32;
                         }
                     }
                     WindowEvent::MouseInput { button, .. } => {
@@ -281,16 +340,16 @@ impl State {
                                     .window
                                     .set_cursor_grab(winit::window::CursorGrabMode::Confined)
                                     .expect("could not grab mouse cursor");
-                                perframe_data.action1 = true as _;
+                                input.action1 = true as _;
                             }
                             Right => {
-                                perframe_data.action2 = true as _;
+                                input.action2 = true as _;
                             }
                             _ => {}
                         }
                     }
-                    WindowEvent::KeyboardInput { input, .. } => {
-                        let Some(key_code) = input.virtual_keycode else {
+                    WindowEvent::KeyboardInput { input: key_input, .. } => {
+                        let Some(key_code) = key_input.virtual_keycode else {
                     return;
                 };
 
@@ -298,28 +357,28 @@ impl State {
 
                         match key_code {
                             W => {
-                                perframe_data.forward =
-                                    (input.state == winit::event::ElementState::Pressed) as _
+                                input.forward =
+                                    (key_input.state == winit::event::ElementState::Pressed) as _
                             }
                             A => {
-                                perframe_data.left =
-                                    (input.state == winit::event::ElementState::Pressed) as _
+                                input.left =
+                                    (key_input.state == winit::event::ElementState::Pressed) as _
                             }
                             S => {
-                                perframe_data.backward =
-                                    (input.state == winit::event::ElementState::Pressed) as _
+                                input.backward =
+                                    (key_input.state == winit::event::ElementState::Pressed) as _
                             }
                             D => {
-                                perframe_data.right =
-                                    (input.state == winit::event::ElementState::Pressed) as _
+                                input.right =
+                                    (key_input.state == winit::event::ElementState::Pressed) as _
                             }
                             Space => {
-                                perframe_data.up =
-                                    (input.state == winit::event::ElementState::Pressed) as _
+                                input.up =
+                                    (key_input.state == winit::event::ElementState::Pressed) as _
                             }
                             LShift => {
-                                perframe_data.down =
-                                    (input.state == winit::event::ElementState::Pressed) as _
+                                input.down =
+                                    (key_input.state == winit::event::ElementState::Pressed) as _
                             }
                             Escape => {
                                 cursor_captured = false;
@@ -341,18 +400,59 @@ impl State {
                 let current_instant = time::Instant::now();
                 let delta_time = current_instant.duration_since(last_instant).as_secs_f32();
                 last_instant = current_instant;
-                World::update(delta_time, &mut perframe_data);
+
+                self.resources.insert(Time { delta_time });
+
+                {
+                let mut egui_io = self.resources.get_mut::<EguiIo>().unwrap();
+                let mut egui_state = self.resources.get_mut::<EguiState>().unwrap();
+
+                egui_io.window_input =
+                    Some(egui_state.take_egui_input(&self.graphics.window));
+                }
+
+                let mut schedule = Schedule::builder()
+                    .add_system(input_system())
+                    .add_system(camera_system())
+                    .add_system(ui_system())
+                    .build();
+
+                schedule.execute(&mut self.world, &mut self.resources);
 
                 self.graphics.window.set_title(&format!(
                     "Game | Frame time: {} ms",
                     (delta_time * 1000.0) as u32
                 ));
 
-                match self.graphics.render(perframe_data) {
-                    Err(wgpu::SurfaceError::Outdated)
-                    | Ok(_) if self.graphics.config.width != self.graphics.window_size.width
-                        || self.graphics.config.height != self.graphics.window_size.height
-                        => self.graphics.resize(),
+                let camera = *self
+                    .resources
+                    .get::<Camera>()
+                    .expect("Perframe data not added");
+                
+                let input = *self
+                    .resources
+                    .get::<Input>()
+                    .expect("Perframe data not added");
+
+                let mut egui_renderer = self.resources.get_mut::<EguiRenderer>().expect("Egui not addded");
+                let mut egui_context = self.resources.get_mut::<EguiContext>().expect("Egui not addded");
+                let mut egui_io = self.resources.get_mut::<EguiIo>().expect("Egui not addded");
+
+                match self.graphics.render(FrameData {
+                    perframe_data: PerframeData {
+                        camera,
+                        input,
+                    },
+                    egui_renderer: &mut egui_renderer,
+                    egui_context: &mut egui_context,
+                    egui_io: &mut egui_io,
+                }) {
+                    Err(wgpu::SurfaceError::Outdated) | Ok(_)
+                        if self.graphics.config.width != self.graphics.window_size.width
+                            || self.graphics.config.height != self.graphics.window_size.height =>
+                    {
+                        self.graphics.resize()
+                    }
                     Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
                     _ => {}
                 }
@@ -379,8 +479,7 @@ struct Camera {
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-struct PerframeData {
-    camera: Camera,
+struct Input {
     up: u32,
     down: u32,
     left: u32,
@@ -393,17 +492,35 @@ struct PerframeData {
     rot_z: f32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct PerframeData {
+    camera: Camera,
+    input: Input
+}
+
 unsafe impl bytemuck::Zeroable for PerframeData {}
 unsafe impl bytemuck::Pod for PerframeData {}
 
-struct Egui {
-    state: egui_winit::State,
-    renderer: egui_wgpu::Renderer,
-    context: egui::Context,
+struct FrameData<'a> {
+    perframe_data: PerframeData,
+    egui_renderer: &'a mut EguiRenderer,
+    egui_context: &'a mut EguiContext,
+    egui_io: &'a mut EguiIo,
+}
+
+type EguiState = egui_winit::State;
+type EguiRenderer = egui_wgpu::Renderer;
+type EguiContext = egui::Context;
+
+struct EguiIo {
+    full_output: Option<egui::FullOutput>,
+    window_input: Option<egui::RawInput>,
 }
 
 struct Graphics {
     surface: wgpu::Surface,
+    surface_format: wgpu::TextureFormat,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -427,7 +544,6 @@ struct Graphics {
     world_pipeline: wgpu::ComputePipeline,
     world_group: wgpu::BindGroup,
     world_storage_group: wgpu::BindGroup,
-    egui: Egui,
 }
 
 impl Graphics {
@@ -532,23 +648,23 @@ impl Graphics {
         });
 
         let mut samples = vec![];
-        let continentalness = World::continentalness();
-        let erosion = World::erosion();
-        let pandv = World::pandv();
+        let continentalness = world_gen::continentalness();
+        let erosion = world_gen::erosion();
+        let pandv = world_gen::pandv();
 
-        for i in 0..SAMPLE_COUNT { 
+        for i in 0..SAMPLE_COUNT {
             let x = i as f64 * (1.0 / SAMPLE_COUNT as f64);
             let y = continentalness.sample(x as f32).unwrap() as f32;
             samples.push(y);
         }
-        
-        for i in 0..SAMPLE_COUNT { 
+
+        for i in 0..SAMPLE_COUNT {
             let x = i as f64 * (1.0 / SAMPLE_COUNT as f64);
             let y = erosion.sample(x as f32).unwrap() as f32;
             samples.push(y);
         }
-        
-        for i in 0..SAMPLE_COUNT { 
+
+        for i in 0..SAMPLE_COUNT {
             let x = i as f64 * (1.0 / SAMPLE_COUNT as f64);
             let y = pandv.sample(x as f32).unwrap() as f32;
             samples.push(y);
@@ -580,8 +696,7 @@ impl Graphics {
             view_formats: &[],
         });
 
-        let world_texture_view =
-            world_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let world_texture_view = world_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let world_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -762,7 +877,7 @@ impl Graphics {
 
         let world_edit_shader = Self::shader_module(&device, "world_edit.wgsl");
         let general_shader = Self::shader_module(&device, "general.wgsl");
-        
+
         let perframe_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
             layout: Some(&pipeline_layout),
@@ -819,52 +934,53 @@ impl Graphics {
             ..Default::default()
         });
 
-        let front_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &general_shader,
-                entry_point: "vs_main", // 1.
-                buffers: &[],           // 2.
-            },
-            fragment: Some(wgpu::FragmentState {
-                // 3.
-                module: &general_shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    // 4.
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList, // 1.
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw, // 2.
-                cull_mode: Some(wgpu::Face::Back),
-                // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
-                polygon_mode: wgpu::PolygonMode::Fill,
-                // Requires Features::DEPTH_CLIP_CONTROL
-                unclipped_depth: false,
-                // Requires Features::CONSERVATIVE_RASTERIZATION
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less, // 1.
-                stencil: wgpu::StencilState::default(),     // 2.
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: 1,                         // 2.
-                mask: !0,                         // 3.
-                alpha_to_coverage_enabled: false, // 4.
-            },
-            multiview: None, // 5.
-        });
-        
+        let front_render_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Render Pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &general_shader,
+                    entry_point: "vs_main", // 1.
+                    buffers: &[],           // 2.
+                },
+                fragment: Some(wgpu::FragmentState {
+                    // 3.
+                    module: &general_shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        // 4.
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList, // 1.
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw, // 2.
+                    cull_mode: Some(wgpu::Face::Back),
+                    // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    // Requires Features::DEPTH_CLIP_CONTROL
+                    unclipped_depth: false,
+                    // Requires Features::CONSERVATIVE_RASTERIZATION
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less, // 1.
+                    stencil: wgpu::StencilState::default(),     // 2.
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: 1,                         // 2.
+                    mask: !0,                         // 3.
+                    alpha_to_coverage_enabled: false, // 4.
+                },
+                multiview: None, // 5.
+            });
+
         let back_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             layout: Some(&pipeline_layout),
@@ -900,7 +1016,7 @@ impl Graphics {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: true,
                 depth_compare: wgpu::CompareFunction::Always, // 1.
-                stencil: wgpu::StencilState::default(),     // 2.
+                stencil: wgpu::StencilState::default(),       // 2.
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
@@ -911,26 +1027,10 @@ impl Graphics {
             multiview: None, // 5.
         });
 
-        let egui_renderer = egui_wgpu::Renderer::new(
-            &device,
-            surface_format,
-            Some(wgpu::TextureFormat::Depth32Float),
-            1,
-        );
-
-        let egui_state = egui_winit::State::new(&event_loop);
-
-        let egui_context = egui::Context::default();
-
-        let egui = Egui {
-            renderer: egui_renderer,
-            state: egui_state,
-            context: egui_context,
-        };
-
         Self {
             window,
             surface,
+            surface_format,
             device,
             queue,
             config,
@@ -953,7 +1053,6 @@ impl Graphics {
             world_storage_group,
             world_texture,
             world_texture_view,
-            egui,
         }
     }
 
@@ -1000,28 +1099,7 @@ impl Graphics {
         }
     }
 
-    fn ui(ctx: &egui::Context) {
-        egui::Window::new("My Window")
-            .default_open(true)
-            .show(ctx, |ui| {
-                use egui::plot::{Line, Plot, PlotPoints};
-                let resolution = 1000;
-                let spline = World::pandv();
-                let sin: PlotPoints = (0..resolution)
-                    .map(|i| {
-                        let x = i as f64 * (1.0 / resolution as f64);
-                        let y = spline.sample(x as f32).unwrap();
-                        [x, y as f64]
-                    })
-                    .collect();
-                let line = Line::new(sin);
-                Plot::new("my_plot")
-                    .view_aspect(2.0)
-                    .show(ui, |plot_ui| plot_ui.line(line));
-            });
-    }
-
-    fn render(&mut self, perframe_data: PerframeData) -> Result<(), wgpu::SurfaceError> {
+    fn render(&mut self, mut frame_data: FrameData<'_>) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
 
         let view = output
@@ -1031,7 +1109,7 @@ impl Graphics {
         self.queue.write_buffer(
             &self.perframe_buffer,
             0,
-            bytemuck::cast_slice(&[perframe_data]),
+            bytemuck::cast_slice(&[frame_data.perframe_data]),
         );
 
         let mut encoder = self
@@ -1102,14 +1180,11 @@ impl Graphics {
 
         //Draw the ui. Note this is not where the ui is rendered.
         //the ui is rendered after the world
-        self.egui.context.request_repaint();
+        frame_data.egui_context.request_repaint();
 
-        let full_output = self
-            .egui
-            .context
-            .run(self.egui.state.take_egui_input(&self.window), Self::ui);
+        let full_output = frame_data.egui_io.full_output.take().unwrap();
 
-        let clipped_primitives = self.egui.context.tessellate(full_output.shapes);
+        let clipped_primitives = frame_data.egui_context.tessellate(full_output.shapes);
 
         let screen_descriptor = egui_wgpu::renderer::ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
@@ -1117,12 +1192,12 @@ impl Graphics {
         };
 
         for (id, delta) in full_output.textures_delta.set {
-            self.egui
-                .renderer
+            frame_data
+                .egui_renderer
                 .update_texture(&self.device, &self.queue, id, &delta);
         }
 
-        self.egui.renderer.update_buffers(
+        frame_data.egui_renderer.update_buffers(
             &self.device,
             &self.queue,
             &mut encoder,
@@ -1168,19 +1243,21 @@ impl Graphics {
                         + (i as usize * mem::size_of::<wgpu::util::DrawIndirect>()) as u64,
                 );
             }
-            
+
             render_pass.set_pipeline(&self.back_render_pipeline);
-                
+
             render_pass.draw_indirect(
-                    &self.indirect_buffer,
-                    (2 * mem::size_of::<wgpu::util::DispatchIndirect>()) as u64
-                        + (MAX_BATCHES as usize * mem::size_of::<wgpu::util::DrawIndirect>()) as u64,
+                &self.indirect_buffer,
+                (2 * mem::size_of::<wgpu::util::DispatchIndirect>()) as u64
+                    + (MAX_BATCHES as usize * mem::size_of::<wgpu::util::DrawIndirect>()) as u64,
             );
 
             //Draw the ui after the world
-            self.egui
-                .renderer
-                .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
+            frame_data.egui_renderer.render(
+                &mut render_pass,
+                &clipped_primitives,
+                &screen_descriptor,
+            );
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
